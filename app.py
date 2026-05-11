@@ -1466,11 +1466,12 @@ async def get_task_history(novel_id: int, limit: int = 20, db: AsyncSession = De
 
 
 @app.get("/api/tasks/queue")
-async def list_global_queue(db: AsyncSession = Depends(get_db)):
+async def list_global_queue(limit: int = 80, db: AsyncSession = Depends(get_db)):
+    limit = max(1, min(limit, 200))
     stmt = (
         select(ExpandTask)
-        .where(ExpandTask.status.in_(["queued", "running", "paused"]))
-        .order_by(ExpandTask.created_at.asc(), ExpandTask.id.asc())
+        .order_by(ExpandTask.updated_at.desc(), ExpandTask.created_at.desc(), ExpandTask.id.desc())
+        .limit(limit)
     )
     result = await db.execute(stmt)
     tasks = result.scalars().all()

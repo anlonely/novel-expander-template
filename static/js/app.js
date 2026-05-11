@@ -64,7 +64,6 @@ const app = createApp({
         const isMobileLayout = ref(false);
         const exportFormat = ref('txt');
         const exportSeparatorStyle = ref('classic');
-        const showTaskHistory = ref(true);
         const queueTasks = ref([]);
 
         // API Profiles
@@ -2177,7 +2176,6 @@ const app = createApp({
             manualEditIndex,
             manualEditText,
             sseReconnecting,
-            showTaskHistory,
             queueTasks,
 
             // Computed

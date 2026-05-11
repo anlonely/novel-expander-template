@@ -412,33 +412,10 @@
                 </div>
             </div>
 
-            <!-- 3. Task History -->
-            <div class="panel-section panel-history">
-                <div class="panel-section-title" style="cursor: pointer; user-select: none;" @click="showTaskHistory = !showTaskHistory">
-                    <span>任务历史</span>
-                    <span class="text-muted">{{ showTaskHistory ? '▾' : '▸' }} {{ taskHistory.length }}</span>
-                </div>
-                <div class="task-history-list" v-if="showTaskHistory">
-                    <div v-for="task in taskHistory" :key="task.id" class="task-history-item">
-                        <div class="task-history-top">
-                            <span>#{{ task.id }} {{ taskStatusText(task) }}</span>
-                            <span class="text-muted">{{ formatDate(task.created_at) }}</span>
-                        </div>
-                        <div class="task-history-meta">
-                            {{ task.model }} · {{ task.completed_chapters }}/{{ task.total_chapters }}完成 · {{ formatDuration(task.duration_seconds) }}
-                        </div>
-                        <div v-if="task.error_message" class="task-history-error">{{ task.error_message }}</div>
-                    </div>
-                    <div v-if="taskHistory.length === 0" class="text-muted task-history-empty">
-                        暂无任务历史
-                    </div>
-                </div>
-            </div>
-
-            <!-- 4. Global Queue -->
+            <!-- 3. Global Tasks -->
             <div class="panel-section panel-history">
                 <div class="panel-section-title">
-                    <span>任务队列</span>
+                    <span>任务</span>
                     <span class="text-muted">{{ queueTasks.length }}</span>
                 </div>
                 <div class="task-history-list">
@@ -448,7 +425,7 @@
                             <span class="text-muted">{{ formatDate(task.created_at) }}</span>
                         </div>
                         <div class="task-history-meta">
-                            {{ task.model }} · {{ task.completed_chapters }}/{{ task.total_chapters }}完成
+                            {{ task.model }} · {{ task.completed_chapters }}/{{ task.total_chapters }}完成 · {{ formatDuration(task.duration_seconds) }}
                         </div>
                         <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
                             <button class="btn btn-ghost btn-sm" @click="prioritizeTask(task.id)" :disabled="task.status !== 'queued'">置顶</button>
@@ -456,9 +433,10 @@
                             <button class="btn btn-ghost btn-sm" @click="resumeQueueTask(task.id)" :disabled="task.status !== 'paused'">恢复</button>
                             <button class="btn btn-danger btn-sm" @click="cancelTaskById(task.id)" :disabled="task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'">取消</button>
                         </div>
+                        <div v-if="task.error_message" class="task-history-error">{{ task.error_message }}</div>
                     </div>
                     <div v-if="queueTasks.length === 0" class="text-muted task-history-empty">
-                        队列为空
+                        暂无任务
                     </div>
                 </div>
             </div>
