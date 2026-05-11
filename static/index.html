@@ -1,0 +1,892 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>小说扩写助手</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2316223a'/%3E%3Cpath d='M18 16h21c4 0 7 3 7 7v25H24c-3 0-6-3-6-6V16Z' fill='%23f2c66d'/%3E%3Cpath d='M24 23h16M24 31h13M24 39h10' stroke='%2316223a' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+    <link rel="stylesheet" href="/static/css/style.css?v=20260429-login-page">
+</head>
+<body>
+
+<div id="app" v-cloak>
+
+    <!-- ==================== Notifications ==================== -->
+    <div class="notification-container">
+        <div
+            v-for="notif in notifications"
+            :key="notif.id"
+            class="notification"
+            :class="notif.type"
+        >
+            <span>{{ notif.msg }}</span>
+            <span class="notif-close" @click="removeNotification(notif.id)">&times;</span>
+        </div>
+    </div>
+
+    <!-- ==================== Header ==================== -->
+    <header class="app-header">
+        <div class="logo">
+            <span class="icon">&#9997;</span>
+            <span>小说扩写助手</span>
+        </div>
+        <!-- API Profile Indicator -->
+        <div class="api-profile-indicator" v-if="activeProfile" @click="openSettingsModal" title="点击切换 API 配置">
+            <span class="profile-dot"></span>
+            <span class="profile-name">{{ activeProfile.name }}</span>
+        </div>
+        <div class="header-actions">
+            <button class="btn btn-ghost btn-sm mobile-toggle" @click="leftCollapsed = !leftCollapsed">
+                &#9776;
+            </button>
+            <button class="btn btn-ghost btn-sm desktop-action" @click="showUploadModal = true">
+                &#128228; 上传小说
+            </button>
+            <button class="btn btn-ghost btn-sm desktop-action" @click="exportNovel" :disabled="!currentNovel">
+                &#128229; 导出
+            </button>
+            <button class="btn btn-ghost btn-sm desktop-action" @click="openPromptSettingsModal">
+                &#129504; 提示词
+            </button>
+            <button class="btn btn-ghost btn-sm desktop-action" @click="openSettingsModal">
+                &#9881; 设置
+            </button>
+            <form class="logout-form desktop-action" method="post" action="/api/logout">
+                <button class="btn btn-ghost btn-sm" type="submit">
+                    退出
+                </button>
+            </form>
+            <button class="btn btn-ghost btn-sm mobile-toggle" @click="rightCollapsed = !rightCollapsed">
+                &#9881;
+            </button>
+        </div>
+    </header>
+
+    <!-- ==================== Body ==================== -->
+    <div class="app-body">
+
+        <!-- ========== Left Sidebar ========== -->
+        <aside class="sidebar-left" :class="{ collapsed: leftCollapsed }">
+            <!-- Novels Section -->
+            <div class="sidebar-section" style="flex: 0 0 auto; max-height: 45%;">
+                <div class="sidebar-section-title">
+                    <span>小说列表</span>
+                    <span class="text-muted">{{ novels.length }}</span>
+                </div>
+                <div class="novel-list">
+                    <div
+                        v-for="novel in novels"
+                        :key="novel.id"
+                        class="novel-item"
+                        :class="{ active: currentNovel && currentNovel.id === novel.id }"
+                        @click="selectNovel(novel)"
+                    >
+                        <span v-if="novel.has_expanded" class="novel-badge"></span>
+                        <span class="novel-title">{{ novel.title }}</span>
+                        <span class="novel-meta">{{ novel.chapter_count }}章</span>
+                        <span class="delete-btn" @click.stop="deleteNovel(novel)">&times;</span>
+                    </div>
+                    <div v-if="novels.length === 0" class="text-muted" style="padding: 12px; font-size: 13px; text-align: center;">
+                        暂无小说，请上传
+                    </div>
+                </div>
+            </div>
+
+            <div class="divider"></div>
+
+            <!-- Chapters Section -->
+            <div class="sidebar-section" style="flex: 1; min-height: 0;">
+                <div class="sidebar-section-title">
+                    <span>章节列表</span>
+                    <span class="text-muted" v-if="currentNovel">{{ chapters.length }}章</span>
+                </div>
+                <div class="chapter-list" ref="leftChapterListRef" @scroll="onLeftChapterScroll">
+                    <div :style="{ height: leftSpacerTop + 'px' }"></div>
+                    <div
+                        v-for="chapter in visibleChapters"
+                        :key="chapter.id"
+                        class="chapter-item"
+                        :class="{ active: currentChapter && currentChapter.id === chapter.id }"
+                        :title="chapterStatusText(chapter)"
+                        @click="selectChapter(chapter)"
+                    >
+                        <span class="chapter-status">{{ chapterStatusIcon(chapter.status) }}</span>
+                        <span class="chapter-title">{{ chapter.title }}</span>
+                        <span class="chapter-wc">
+                            {{ chapter.has_expanded ? formatWordCount(chapter.expanded_word_count) : formatWordCount(chapter.original_word_count) }}字
+                        </span>
+                    </div>
+                    <div v-if="!currentNovel" class="text-muted" style="padding: 12px; font-size: 13px; text-align: center;">
+                        请先选择小说
+                    </div>
+                    <div v-else-if="chapters.length === 0" class="text-muted" style="padding: 12px; font-size: 13px; text-align: center;">
+                        暂无章节
+                    </div>
+                    <div :style="{ height: leftSpacerBottom + 'px' }"></div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- ========== Main Content ========== -->
+        <main class="main-content">
+            <!-- Content Header -->
+            <div class="content-header" v-if="currentChapter">
+                <span class="chapter-name">{{ currentChapter.title }}</span>
+                <div class="view-tabs">
+                    <button
+                        class="view-tab"
+                        :class="{ active: viewMode === 'original' }"
+                        @click="viewMode = 'original'"
+                    >原文</button>
+                    <button
+                        class="view-tab"
+                        :class="{ active: viewMode === 'expanded' }"
+                        @click="viewMode = 'expanded'"
+                        :disabled="!hasExpanded"
+                    >扩写</button>
+                    <button
+                        class="view-tab"
+                        :class="{ active: viewMode === 'compare' }"
+                        @click="viewMode = 'compare'"
+                        :disabled="!hasExpanded"
+                    >对比</button>
+                    <button
+                        class="btn btn-primary btn-sm"
+                        style="margin-left: 12px;"
+                        @click="showChapterRewriteInstruction"
+                        :disabled="isExpanding || isExpandingCurrent || isChapterRewriting"
+                    >
+                        <span v-if="isChapterRewriting" class="spinner"></span>
+                        &#128221; 指令重写整章
+                    </button>
+                    <button
+                        v-if="hasExpanded"
+                        class="btn btn-ghost btn-sm"
+                        style="margin-left: 4px;"
+                        @click="undoExpansion"
+                        :disabled="!canUndo"
+                    >&#8630; 撤销</button>
+                </div>
+            </div>
+
+            <!-- Content Body -->
+            <div class="content-body">
+
+                <!-- Empty State -->
+                <div v-if="!currentChapter" class="empty-state">
+                    <div class="empty-icon">&#128214;</div>
+                    <div class="empty-text">请选择一个章节开始阅读</div>
+                    <div class="empty-hint">从左侧列表选择小说和章节，或上传新的小说文件</div>
+                </div>
+
+                <!-- Compare View -->
+                <div v-else-if="viewMode === 'compare'" class="compare-view">
+                    <div class="compare-column">
+                        <div class="compare-column-title">原文</div>
+                        <div class="reading-area">
+                            <div
+                                v-for="para in originalParagraphs"
+                                :key="'orig-' + para.index"
+                                class="paragraph-block"
+                                :class="{ changed: isParagraphDifferent(para.index) }"
+                            >
+                                <span class="para-index">{{ para.index + 1 }}</span>
+                                <div class="para-text" v-html="renderCompareDiff(para.index, 'original')"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="compare-column">
+                        <div class="compare-column-title">扩写</div>
+                        <div class="reading-area">
+                            <div
+                                v-for="para in expandedParagraphs"
+                                :key="'exp-' + para.index"
+                                class="paragraph-block expanded"
+                                :class="{ changed: isParagraphDifferent(para.index) }"
+                            >
+                                <span class="para-index">{{ para.index + 1 }}</span>
+                                <div class="para-text" v-html="renderCompareDiff(para.index, 'expanded')"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Reading View (original or expanded) -->
+                <div v-else class="reading-area">
+                    <div v-if="currentChapter.error_message" class="chapter-message error">
+                        本章上次失败：{{ currentChapter.error_message }}
+                    </div>
+                    <div v-else-if="currentChapter.skipped" class="chapter-message warning">
+                        本章未检测到明确的省略或删减痕迹，已按原文保留。
+                    </div>
+                    <div v-if="chapterRewritePromptVisible" class="instruction-input-wrap">
+                        <textarea
+                            v-model="chapterRewriteInstruction"
+                            rows="3"
+                            placeholder="输入追加指令，模型会基于当前整章内容重写。例：加强暧昧拉扯，补足心理活动，但不改变剧情走向。Ctrl/⌘ + Enter 提交，Esc 取消。"
+                            @keydown="onChapterRewriteKeydown($event)"
+                        ></textarea>
+                        <button class="btn btn-primary btn-sm" @click="submitChapterRewriteInstruction">提交整章重写</button>
+                        <button class="btn btn-ghost btn-sm" @click="cancelChapterRewriteInstruction">取消</button>
+                    </div>
+                    <div v-if="isChapterRewriting" class="chapter-message info">
+                        正在按指令重写整章，请等待流式结果保存完成。
+                    </div>
+                    <template v-for="para in displayParagraphs" :key="para.index">
+                        <div
+                            class="paragraph-block"
+                            :class="{
+                                expanded: viewMode === 'expanded' && !isStreamingPara(para.index),
+                                expanding: isStreamingPara(para.index),
+                                changed: viewMode === 'expanded' && isParagraphDifferent(para.index)
+                            }"
+                            @mouseenter="hoveredParagraphIndex = para.index"
+                            @mouseleave="hoveredParagraphIndex = null"
+                        >
+                            <span class="para-index">{{ para.index + 1 }}</span>
+                            <div class="para-text" :data-para-index="para.index">
+                                {{ getParaDisplayText(para) }}<span v-if="isStreamingPara(para.index)" class="typing-cursor"></span>
+                            </div>
+
+                            <!-- Paragraph Actions -->
+                            <div
+                                class="para-actions"
+                                v-if="viewMode === 'expanded' && hoveredParagraphIndex === para.index && !isStreamingPara(para.index) && editingParagraphIndex !== para.index"
+                            >
+                                <button class="para-action-btn" @click="startEditParagraph(para.index)">
+                                    &#9998; 手动编辑
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Manual Edit -->
+                        <div
+                            v-if="manualEditIndex === para.index"
+                            class="instruction-input-wrap"
+                        >
+                            <textarea
+                                v-model="manualEditText"
+                                class="para-edit-textarea"
+                                rows="5"
+                                placeholder="直接修改这段扩写结果，然后保存..."
+                            ></textarea>
+                            <button class="btn btn-primary btn-sm" @click="saveManualEdit">保存</button>
+                            <button class="btn btn-ghost btn-sm" @click="cancelManualEdit">取消</button>
+                        </div>
+                    </template>
+                </div>
+
+            </div>
+        </main>
+
+        <!-- ========== Right Sidebar ========== -->
+        <aside class="sidebar-right" :class="{ collapsed: rightCollapsed }">
+
+            <!-- 1. Progress and task control -->
+            <div class="panel-section panel-progress">
+                <div class="panel-section-title">
+                    <span>扩写进度</span>
+                    <span class="text-muted" v-if="!isExpanding && overallProgress <= 0">待开始</span>
+                </div>
+                <div v-if="sseReconnecting" class="chapter-message warning" style="margin-bottom: 8px; padding: 6px 10px;">
+                    SSE 连接断开，正在重连…
+                </div>
+                <div v-if="tokenWarning" class="chapter-message warning" style="margin-bottom: 8px; padding: 6px 10px;">
+                    Token 较少，自动降速等待恢复
+                </div>
+                <div class="progress-idle" v-if="!isExpanding && overallProgress <= 0">
+                    选择章节后开始扩写，进度、失败数和日志会显示在这里。
+                </div>
+                <div class="progress-bar-wrap" v-else>
+                    <div class="progress-bar-fill" :style="{ width: progressPercent + '%' }"></div>
+                </div>
+                <div class="progress-stats" v-if="isExpanding || overallProgress > 0">
+                    <span>{{ completedChapters }}/{{ totalChapters }} 章</span>
+                    <span>{{ overallProgress.toFixed(1) }}%</span>
+                </div>
+                <div class="progress-stats mt-2">
+                    <span>失败 {{ failedChaptersCount }} · 跳过 {{ skippedChaptersCount }}</span>
+                    <span v-if="estimatedRemaining" class="text-muted">{{ estimatedRemaining }}</span>
+                </div>
+                <div class="progress-stats mt-2" v-if="currentExpandingChapter">
+                    <span class="text-muted truncate">{{ currentExpandingChapter }}</span>
+                </div>
+                <div class="progress-log mt-2" v-if="progressLogs.length > 0">
+                    <div v-for="(log, idx) in progressLogs" :key="idx" class="log-entry">
+                        <span class="log-time">{{ log.time }}</span>
+                        <span :class="'log-msg-' + log.type">{{ log.msg }}</span>
+                    </div>
+                </div>
+                <div class="panel-alert-inline" v-if="interruptedTask">
+                    <div class="panel-alert-row">
+                        <span>&#9888; 检测到未完成任务（{{ interruptedTask.completed_chapters || 0 }}/{{ interruptedTask.total_chapters || 0 }}）</span>
+                    </div>
+                    <div class="panel-alert-actions">
+                        <button class="btn btn-primary btn-sm" @click="resumeTask">继续</button>
+                        <button class="btn btn-ghost btn-sm" @click="dismissInterrupted">忽略</button>
+                    </div>
+                </div>
+                <div class="panel-alert-inline" v-if="showFailedTaskAlert && latestFailedTask">
+                    <div class="panel-alert-row">
+                        <span>&#10060; {{ latestFailedTask.failed_chapters }} 章失败</span>
+                        <div class="panel-alert-actions-inline">
+                            <button
+                                v-if="!isRetryingFailed"
+                                class="btn btn-ghost btn-sm"
+                                @click="retryFailed"
+                                :disabled="isExpanding"
+                            >重试</button>
+                            <button
+                                v-else
+                                class="btn btn-danger btn-sm"
+                                @click="cancelExpand"
+                            >取消重试</button>
+                            <button
+                                v-if="!isRetryingFailed"
+                                class="btn btn-ghost btn-sm"
+                                @click="dismissFailedAlert"
+                            >忽略</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="progress-actions">
+                    <button
+                        v-if="!isExpanding"
+                        class="btn btn-primary btn-block"
+                        @click="startExpand"
+                        :disabled="selectedChapterIds.length === 0"
+                    >
+                        &#9654; 开始扩写 <span v-if="selectedChapterIds.length > 0" class="btn-badge">{{ selectedChapterIds.length }}章</span>
+                    </button>
+                    <button
+                        v-else
+                        class="btn btn-danger btn-block"
+                        @click="cancelExpand"
+                    >
+                        <span class="spinner"></span> 取消扩写
+                    </button>
+                </div>
+            </div>
+
+            <!-- 2. Chapter Selection -->
+            <div class="panel-section panel-chapters">
+                <div class="panel-section-title">
+                    <span>章节选择</span>
+                    <span class="text-muted" v-if="chapters.length > 0">{{ selectedChapterIds.length }}/{{ chapters.length }}</span>
+                </div>
+                <div class="select-all-row" v-if="chapters.length > 0">
+                    <label class="select-all-label">
+                        <input type="checkbox" :checked="allSelected" @change="toggleAllChapters">
+                        全选
+                    </label>
+                    <div class="range-input-inline">
+                        <input
+                            class="range-input"
+                            v-model="chapterRangeInput"
+                            placeholder="如 206-300"
+                            @keydown.enter="applyChapterRange"
+                        >
+                        <button class="btn btn-sm btn-ghost" @click="applyChapterRange">选</button>
+                    </div>
+                </div>
+                <div class="chapter-checkbox-list" ref="rightCheckboxListRef" @scroll="onRightChapterScroll">
+                    <div :style="{ height: rightSpacerTop + 'px' }"></div>
+                    <div
+                        v-for="chapter in visibleSelectableChapters"
+                        :key="'cb-' + chapter.id"
+                        class="chapter-checkbox-item"
+                        :title="chapterStatusText(chapter)"
+                        @click="toggleChapter(chapter.id)"
+                    >
+                        <input type="checkbox" :checked="isChapterSelected(chapter.id)" @click.stop @change="toggleChapter(chapter.id)">
+                        <span class="ch-status">{{ chapterStatusIcon(chapter.status) }}</span>
+                        <label class="chapter-checkbox-label">{{ chapter.title }}</label>
+                    </div>
+                    <div v-if="chapters.length === 0" class="text-muted" style="padding: 12px; font-size: 13px; text-align: center;">
+                        请先选择小说
+                    </div>
+                    <div :style="{ height: rightSpacerBottom + 'px' }"></div>
+                </div>
+            </div>
+
+            <!-- 3. Task History -->
+            <div class="panel-section panel-history">
+                <div class="panel-section-title" style="cursor: pointer; user-select: none;" @click="showTaskHistory = !showTaskHistory">
+                    <span>任务历史</span>
+                    <span class="text-muted">{{ showTaskHistory ? '▾' : '▸' }} {{ taskHistory.length }}</span>
+                </div>
+                <div class="task-history-list" v-if="showTaskHistory">
+                    <div v-for="task in taskHistory" :key="task.id" class="task-history-item">
+                        <div class="task-history-top">
+                            <span>#{{ task.id }} {{ taskStatusText(task) }}</span>
+                            <span class="text-muted">{{ formatDate(task.created_at) }}</span>
+                        </div>
+                        <div class="task-history-meta">
+                            {{ task.model }} · {{ task.completed_chapters }}/{{ task.total_chapters }}完成 · {{ formatDuration(task.duration_seconds) }}
+                        </div>
+                        <div v-if="task.error_message" class="task-history-error">{{ task.error_message }}</div>
+                    </div>
+                    <div v-if="taskHistory.length === 0" class="text-muted task-history-empty">
+                        暂无任务历史
+                    </div>
+                </div>
+            </div>
+
+            <!-- Export (compact) -->
+            <div class="panel-section panel-compact">
+                <div class="config-row">
+                    <span class="config-label">导出</span>
+                    <select class="config-select" v-model="exportFormat">
+                        <option value="txt">TXT</option>
+                        <option value="docx">DOCX</option>
+                        <option value="epub">EPUB</option>
+                    </select>
+                    <select class="config-select" v-if="exportFormat === 'txt'" v-model="exportSeparatorStyle" style="margin-left: 6px;">
+                        <option value="classic">经典分隔</option>
+                        <option value="minimal">最简</option>
+                        <option value="double">加粗</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Shortcuts (bottom, minimal) -->
+            <div class="panel-section panel-footer">
+                <span class="shortcut-hint">J/K 切章 · E 扩写 · U 撤销</span>
+            </div>
+
+        </aside>
+
+    </div>
+
+    <div
+        class="mobile-panel-backdrop"
+        v-if="isMobileLayout && (!leftCollapsed || !rightCollapsed)"
+        @click="closeMobilePanels"
+    ></div>
+
+    <nav class="mobile-bottom-nav">
+        <button class="mobile-nav-btn" :class="{ active: leftCollapsed && rightCollapsed }" @click="showReadingPanel">
+            <span class="mobile-nav-icon">&#128214;</span>
+            <span>阅读</span>
+        </button>
+        <button class="mobile-nav-btn" :class="{ active: !leftCollapsed }" @click="showCatalogPanel">
+            <span class="mobile-nav-icon">&#9776;</span>
+            <span>目录</span>
+        </button>
+        <button class="mobile-nav-btn" :class="{ active: !rightCollapsed }" @click="showTaskPanel">
+            <span class="mobile-nav-icon">&#9881;</span>
+            <span>任务</span>
+        </button>
+        <button class="mobile-nav-btn" @click="openSettingsModal">
+            <span class="mobile-nav-icon">&#9881;</span>
+            <span>设置</span>
+        </button>
+        <form class="mobile-nav-form" method="post" action="/api/logout">
+            <button class="mobile-nav-btn" type="submit">
+                <span class="mobile-nav-icon">&#9210;</span>
+                <span>退出</span>
+            </button>
+        </form>
+    </nav>
+
+    <!-- ==================== Upload Modal ==================== -->
+    <div class="modal-overlay" v-if="showUploadModal" @click.self="showUploadModal = false">
+        <div class="modal-box">
+            <div class="modal-title">
+                &#128228; 上传小说
+                <button class="modal-close" @click="showUploadModal = false">&times;</button>
+            </div>
+            <div
+                class="drop-zone"
+                :class="{ dragover: isDragging }"
+                @dragover="onDragOver($event)"
+                @dragleave="onDragLeave"
+                @drop="onDrop($event)"
+                @click="$refs.fileInput.click()"
+            >
+                <div class="drop-icon">&#128196;</div>
+                <div class="drop-text" v-if="!isUploading">拖放 .txt 文件到此处，或点击选择文件</div>
+                <div class="drop-text" v-else>
+                    <span class="spinner"></span> 上传中...
+                </div>
+                <div class="drop-hint">支持 UTF-8 / GBK 编码的 .txt 文件</div>
+            </div>
+            <input
+                type="file"
+                ref="fileInput"
+                accept=".txt"
+                style="display: none;"
+                @change="onFileInput($event)"
+            >
+        </div>
+    </div>
+
+    <!-- ==================== Settings Modal ==================== -->
+    <div class="modal-overlay" v-if="showSettingsModal" @click.self="showSettingsModal = false">
+        <div class="modal-box modal-box-wide">
+            <div class="modal-title">
+                &#9881; 设置
+                <button class="modal-close" @click="showSettingsModal = false">&times;</button>
+            </div>
+
+            <!-- Loading state -->
+            <div v-if="settingsLoading" class="settings-loading">
+                <div class="spinner"></div>
+                <div>加载设置中...</div>
+            </div>
+
+            <template v-else>
+                <!-- Tab navigation -->
+                <div class="settings-tabs">
+                    <button
+                        class="settings-tab"
+                        :class="{ active: settingsActiveTab === 'profiles' }"
+                        @click="settingsActiveTab = 'profiles'"
+                    >API 配置</button>
+                    <button
+                        class="settings-tab"
+                        :class="{ active: settingsActiveTab === 'expand' }"
+                        @click="settingsActiveTab = 'expand'"
+                    >扩写配置</button>
+                    <button
+                        v-for="(groupLabel, groupKey) in settingsGroups"
+                        :key="groupKey"
+                        class="settings-tab"
+                        :class="{ active: settingsActiveTab === groupKey }"
+                        @click="settingsActiveTab = groupKey"
+                    >{{ groupLabel }}</button>
+                </div>
+
+                <!-- API Profiles Panel -->
+                <div class="settings-panel" v-if="settingsActiveTab === 'profiles'">
+                    <div class="profiles-section">
+                        <div class="profiles-header">
+                            <span class="profiles-title">API 配置列表</span>
+                            <button class="btn btn-primary btn-sm" @click="addNewProfile">&#10133; 新增配置</button>
+                        </div>
+                        <div class="profiles-list">
+                            <div
+                                v-for="(profile, idx) in apiProfiles"
+                                :key="profile.id"
+                                class="profile-card"
+                                :class="{ active: profile.id === activeProfileId }"
+                            >
+                                <div class="profile-card-header">
+                                    <div class="profile-card-left">
+                                        <span class="profile-card-dot" :class="{ active: profile.id === activeProfileId }"></span>
+                                        <template v-if="editingProfileId !== profile.id">
+                                            <span class="profile-card-name">{{ profile.name }}</span>
+                                            <span class="profile-active-badge" v-if="profile.id === activeProfileId">使用中</span>
+                                        </template>
+                                        <input
+                                            v-else
+                                            class="profile-name-input"
+                                            v-model="editingProfileData.name"
+                                            placeholder="配置名称"
+                                        >
+                                    </div>
+                                    <div class="profile-card-actions">
+                                        <template v-if="editingProfileId !== profile.id">
+                                            <button
+                                                class="btn btn-ghost btn-xs"
+                                                v-if="profile.id !== activeProfileId"
+                                                @click="switchProfile(profile.id)"
+                                            >切换</button>
+                                            <button class="btn btn-ghost btn-xs" @click="editProfile(profile)">编辑</button>
+                                            <button
+                                                class="btn btn-ghost btn-xs btn-danger-text"
+                                                v-if="apiProfiles.length > 1"
+                                                @click="deleteProfile(profile.id)"
+                                            >&times;</button>
+                                        </template>
+                                        <template v-else>
+                                            <button class="btn btn-primary btn-xs" @click="saveProfile">保存</button>
+                                            <button class="btn btn-ghost btn-xs" @click="cancelEditProfile">取消</button>
+                                        </template>
+                                    </div>
+                                </div>
+                                <div class="profile-card-body" v-if="editingProfileId === profile.id">
+                                    <div class="profile-field">
+                                        <label>API 地址</label>
+                                        <input class="setting-input" v-model="editingProfileData.api_base" type="text" placeholder="https://api.example.com/v1">
+                                    </div>
+                                    <div class="profile-field">
+                                        <label>API Key</label>
+                                        <input class="setting-input" v-model="editingProfileData.api_key" type="password" autocomplete="off" :placeholder="profile.has_api_key ? '已保存，留空不修改' : 'sk-... / 你的中转 Key'">
+                                    </div>
+                                    <div class="profile-field">
+                                        <label>Admin Key（可选）</label>
+                                        <input class="setting-input" v-model="editingProfileData.admin_api_key" type="password" autocomplete="off" :placeholder="profile.has_admin_api_key ? '已保存，留空不修改' : '仅 token 状态接口需要'">
+                                    </div>
+                                    <div class="profile-field">
+                                        <label>默认模型</label>
+                                        <input class="setting-input" v-model="editingProfileData.default_model" type="text" placeholder="grok-4">
+                                    </div>
+                                    <div class="profile-field">
+                                        <label>备用模型顺序</label>
+                                        <input class="setting-input" v-model="editingProfileData.model_fallback_order" type="text" placeholder="gpt-5.4-mini,gpt-5.4">
+                                    </div>
+                                </div>
+                                <div class="profile-card-summary" v-else>
+                                    <span class="text-muted">{{ profile.api_base }}</span>
+                                    <span class="text-muted">·</span>
+                                    <span class="text-muted">{{ profile.default_model }}</span>
+                                    <span class="text-muted">·</span>
+                                    <span class="text-muted">{{ profile.has_api_key ? 'Key 已配置' : '未配置 Key' }}</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Expand Configuration Panel -->
+                <div class="settings-panel expand-settings-panel" v-else-if="settingsActiveTab === 'expand'">
+                    <div class="setting-card">
+                        <div class="setting-card-title">扩写方式</div>
+                        <div class="setting-card-desc">控制批量扩写时的处理策略。一次扩写适合短中篇章节，分段精细适合长章节或需要更稳定衔接的内容。</div>
+                        <div class="pill-group pill-group-settings">
+                            <button class="pill" :class="{ active: expandMode === 'one_pass' }" @click="expandMode = 'one_pass'">一次扩写</button>
+                            <button class="pill" :class="{ active: expandMode === 'detailed' }" @click="expandMode = 'detailed'">分段精细</button>
+                        </div>
+                    </div>
+
+                    <div class="setting-card">
+                        <div class="setting-card-title">扩写质量</div>
+                        <div class="setting-card-desc">质量越高，单章输出越长、等待时间越久。当前选择会立即用于下一次扩写。</div>
+                        <div class="pill-group pill-group-settings">
+                            <button class="pill" :class="{ active: expandQuality === 'balanced' }" @click="expandQuality = 'balanced'">稳妥</button>
+                            <button class="pill" :class="{ active: expandQuality === 'nuanced' }" @click="expandQuality = 'nuanced'">细腻</button>
+                            <button class="pill pill-accent" :class="{ active: expandQuality === 'unleashed' }" @click="expandQuality = 'unleashed'">放开写</button>
+                        </div>
+                    </div>
+
+                    <div class="setting-card">
+                        <div class="setting-card-title">模型</div>
+                        <div class="setting-card-desc">默认跟随当前 API 配置，也可以临时切换到其他可用模型。</div>
+                        <select class="config-select setting-wide-select" v-model="selectedModel">
+                            <option v-for="m in availableModels" :key="m.id" :value="m.id">
+                                {{ m.name }} · {{ m.desc }}
+                            </option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- Settings fields for active tab (non-profiles) -->
+                <div class="settings-panel" v-else>
+                    <template v-for="(meta, key) in settingsFields" :key="key">
+                        <div class="setting-group" v-if="meta.group === settingsActiveTab">
+                            <label class="setting-label">{{ meta.label }}</label>
+
+                            <!-- String input -->
+                            <input
+                                v-if="meta.type === 'string'"
+                                class="setting-input"
+                                v-model="settingsForm[key]"
+                                type="text"
+                            >
+
+                            <!-- Password input -->
+                            <div v-else-if="meta.type === 'password'" class="setting-password-wrap">
+                                <input
+                                    class="setting-input"
+                                    v-model="settingsForm[key]"
+                                    :type="settingsPasswordVisible[key] ? 'text' : 'password'"
+                                >
+                                <button
+                                    class="setting-password-toggle"
+                                    @click="settingsPasswordVisible[key] = !settingsPasswordVisible[key]"
+                                    type="button"
+                                >{{ settingsPasswordVisible[key] ? '&#128065;' : '&#128064;' }}</button>
+                            </div>
+
+                            <!-- Number input -->
+                            <input
+                                v-else-if="meta.type === 'number'"
+                                class="setting-input setting-number"
+                                v-model.number="settingsForm[key]"
+                                type="number"
+                                :min="meta.min"
+                                :max="meta.max"
+                                :step="meta.step"
+                            >
+
+                            <!-- Boolean toggle -->
+                            <div v-else-if="meta.type === 'boolean'" class="setting-toggle-row">
+                                <button
+                                    type="button"
+                                    class="setting-toggle"
+                                    :class="{ active: settingsForm[key] }"
+                                    @click="settingsForm[key] = !settingsForm[key]"
+                                ></button>
+                                <span class="text-secondary" style="font-size: 13px;">{{ settingsForm[key] ? '已启用' : '已禁用' }}</span>
+                            </div>
+
+                            <!-- Select dropdown -->
+                            <select
+                                v-else-if="meta.type === 'select'"
+                                class="setting-input setting-select"
+                                v-model="settingsForm[key]"
+                            >
+                                <option v-for="opt in meta.options" :key="opt" :value="opt">{{ opt }}</option>
+                            </select>
+
+                            <!-- Range info hint -->
+                            <div class="setting-hint" v-if="meta.min !== undefined && meta.max !== undefined">
+                                范围: {{ meta.min }} ~ {{ meta.max }}，步长: {{ meta.step }}
+                            </div>
+                        </div>
+                    </template>
+                </div>
+
+                <!-- Action buttons -->
+                <div class="settings-actions" v-if="settingsActiveTab !== 'profiles' && settingsActiveTab !== 'expand'">
+                    <div class="settings-actions-left">
+                        <button class="btn btn-ghost" @click="resetSettings" :disabled="settingsSaving">
+                            &#8635; 恢复默认
+                        </button>
+                    </div>
+                    <div class="settings-actions-right">
+                        <button class="btn btn-ghost" @click="showSettingsModal = false">取消</button>
+                        <button class="btn btn-primary" @click="saveSettings" :disabled="settingsSaving">
+                        <span v-if="settingsSaving" class="spinner"></span>
+                        {{ settingsSaving ? '保存中...' : '保存设置' }}
+                    </button>
+                    </div>
+                </div>
+                <div class="settings-actions" v-else-if="settingsActiveTab === 'expand'">
+                    <div class="settings-actions-left">
+                        <span class="setting-hint">扩写配置会保存在当前浏览器，下次打开自动恢复。</span>
+                    </div>
+                    <div class="settings-actions-right">
+                        <button class="btn btn-ghost" @click="showSettingsModal = false">取消</button>
+                        <button class="btn btn-primary" @click="saveExpansionSettings(true)">保存扩写配置</button>
+                    </div>
+                </div>
+            </template>
+        </div>
+    </div>
+
+    <!-- ==================== Prompt Settings Modal ==================== -->
+    <div class="modal-overlay" v-if="showPromptSettingsModal" @click.self="showPromptSettingsModal = false">
+        <div class="modal-box modal-box-wide prompt-modal">
+            <div class="modal-title">
+                &#129504; 提示词设置
+                <button class="modal-close" @click="showPromptSettingsModal = false">&times;</button>
+            </div>
+
+            <div v-if="promptSettingsLoading" class="settings-loading">
+                <div class="spinner"></div>
+                <div>加载提示词中...</div>
+            </div>
+
+            <template v-else>
+                <div class="settings-tabs prompt-tabs">
+                    <button
+                        v-for="(groupLabel, groupKey) in promptGroups"
+                        :key="groupKey"
+                        class="settings-tab"
+                        :class="{ active: promptSettingsActiveGroup === groupKey }"
+                        @click="promptSettingsActiveGroup = groupKey"
+                    >{{ groupLabel }}</button>
+                </div>
+
+                <div class="settings-panel prompt-panel">
+                    <div class="prompt-help">
+                        修改后会保存到服务器 <code>data/prompts.json</code>，生成时立即使用。模板变量请保留花括号格式，例如 <code>{chapter_content}</code>。
+                    </div>
+                    <template v-for="item in promptItems" :key="item.key">
+                        <div class="prompt-editor" v-if="item.group === promptSettingsActiveGroup">
+                            <div class="prompt-editor-head">
+                                <div>
+                                    <label class="setting-label">{{ item.label }}</label>
+                                    <div class="setting-hint">{{ item.description }}</div>
+                                </div>
+                                <div class="prompt-editor-actions">
+                                    <span class="prompt-custom-badge" v-if="item.is_custom">已自定义</span>
+                                    <button class="btn btn-ghost btn-xs" @click="resetSinglePrompt(item.key)">恢复此项</button>
+                                </div>
+                            </div>
+                            <textarea
+                                class="setting-input prompt-textarea"
+                                v-model="promptForm[item.key]"
+                                :rows="item.rows || 12"
+                                spellcheck="false"
+                            ></textarea>
+                        </div>
+                    </template>
+                </div>
+
+                <div class="settings-actions">
+                    <div class="settings-actions-left">
+                        <button class="btn btn-ghost" @click="resetPromptSettings" :disabled="promptSettingsSaving">
+                            &#8635; 全部恢复默认
+                        </button>
+                    </div>
+                    <div class="settings-actions-right">
+                        <button class="btn btn-ghost" @click="showPromptSettingsModal = false">取消</button>
+                        <button class="btn btn-primary" @click="savePromptSettings" :disabled="promptSettingsSaving">
+                            <span v-if="promptSettingsSaving" class="spinner"></span>
+                            {{ promptSettingsSaving ? '保存中...' : '保存提示词' }}
+                        </button>
+                    </div>
+                </div>
+            </template>
+        </div>
+    </div>
+
+    <!-- ==================== Delete Confirmation Modal ==================== -->
+    <div class="modal-overlay" v-if="showDeleteConfirm" @click.self="showDeleteConfirm = false; deleteTarget = null">
+        <div class="modal-box">
+            <div class="modal-title">
+                &#9888; 确认删除
+            </div>
+            <p class="text-secondary mb-3" v-if="deleteTarget">
+                确定要删除《{{ deleteTarget.title }}》吗？此操作不可撤销，所有章节和扩写内容将被永久删除。
+            </p>
+            <div class="confirm-actions">
+                <button class="btn btn-ghost" @click="showDeleteConfirm = false; deleteTarget = null">取消</button>
+                <button class="btn btn-danger" @click="confirmDelete">确认删除</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== Expand Confirm Modal ==================== -->
+    <div class="modal-overlay" v-if="showExpandConfirm" @click.self="showExpandConfirm = false">
+        <div class="modal-box">
+            <div class="modal-title">
+                &#128200; 扩写确认
+                <button class="modal-close" @click="showExpandConfirm = false">&times;</button>
+            </div>
+            <div class="progress-stats" style="margin-bottom: 10px;">
+                <span>章节数</span>
+                <span>{{ expandEstimate?.chapter_count || selectedChapterIds.length }}</span>
+            </div>
+            <div class="progress-stats" style="margin-bottom: 10px;">
+                <span>总字数</span>
+                <span>{{ formatWordCount(expandEstimate?.total_chars || 0) }}</span>
+            </div>
+            <div class="progress-stats" style="margin-bottom: 10px;">
+                <span>预计耗时</span>
+                <span>{{ expandEstimate?.estimated_minutes || 0 }} 分钟</span>
+            </div>
+            <div class="progress-stats" style="margin-bottom: 16px;">
+                <span>预计 Token</span>
+                <span>{{ (expandEstimate?.estimated_tokens || 0).toLocaleString('zh-CN') }}</span>
+            </div>
+            <div class="text-secondary" style="font-size: 13px; line-height: 1.6;">
+                系统会优先跳过未检测到明确删减痕迹的章节，避免无中生有。
+            </div>
+            <div class="confirm-actions mt-3">
+                <button class="btn btn-ghost" @click="showExpandConfirm = false">取消</button>
+                <button class="btn btn-primary" @click="confirmAndStartExpand">确认开始</button>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<script src="/static/vendor/vue.global.prod.js"></script>
+<script src="/static/js/app.js?v=20260511-api-key-profiles"></script>
+
+</body>
+</html>

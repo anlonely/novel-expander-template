@@ -1,0 +1,18 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      API_BASE: ${API_BASE:-http://127.0.0.1:8000/v1}
+      API_KEY: ${API_KEY:-}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      DEFAULT_MODEL: ${DEFAULT_MODEL:-gpt-5.4-mini}
+      MODEL_FALLBACK_ORDER: ${MODEL_FALLBACK_ORDER:-gpt-5.4-mini,gpt-5.4,gpt-5.4-high}
+      CONSERVE_REQUESTS: ${CONSERVE_REQUESTS:-true}
+      SITE_AUTH_USERNAME: ${SITE_AUTH_USERNAME:-novel}
+      SITE_AUTH_PASSWORD: ${SITE_AUTH_PASSWORD:-}
+      SITE_AUTH_SECRET: ${SITE_AUTH_SECRET:-}
+      SITE_AUTH_SESSION_DAYS: ${SITE_AUTH_SESSION_DAYS:-30}
+    volumes:
+      - ./data:/app/data

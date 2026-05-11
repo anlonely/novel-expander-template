@@ -1,0 +1,15 @@
+.env
+
+# Runtime secrets (do not commit)
+data/config-backups/
+data/exports/
+
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.DS_Store

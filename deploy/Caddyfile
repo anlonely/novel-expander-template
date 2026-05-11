@@ -1,0 +1,7 @@
+novel.anlonely.me {
+  encode zstd gzip
+
+  # FastAPI app
+  reverse_proxy app:8899
+}
+
