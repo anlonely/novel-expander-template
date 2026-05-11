@@ -71,6 +71,7 @@ cancel_events: Dict[int, asyncio.Event] = {}
 active_tasks: Dict[int, asyncio.Task] = {}
 queue_dispatcher_task: Optional[asyncio.Task] = None
 pause_requests: set[int] = set()
+queue_dispatch_lock = asyncio.Lock()
 
 # 进度写库节流：上次写库时间戳
 _last_progress_db_write = 0.0
@@ -149,35 +150,49 @@ async def _find_live_task_for_novel(db: AsyncSession, novel_id: int) -> Optional
 
 
 async def _dispatch_next_task():
-    for task_id, task in list(active_tasks.items()):
-        if task.done():
-            active_tasks.pop(task_id, None)
-            cancel_events.pop(task_id, None)
+    async with queue_dispatch_lock:
+        for task_id, task in list(active_tasks.items()):
+            if task.done():
+                active_tasks.pop(task_id, None)
+                cancel_events.pop(task_id, None)
 
-    if active_tasks:
-        return
-    async with async_session() as db:
-        stmt = (
-            select(ExpandTask)
-            .where(ExpandTask.status == "queued")
-            .order_by(ExpandTask.created_at.asc(), ExpandTask.id.asc())
-            .limit(1)
-        )
-        result = await db.execute(stmt)
-        task = result.scalar_one_or_none()
-        if not task:
-            return
-        cancel_event = asyncio.Event()
-        cancel_events[task.id] = cancel_event
-        resume_from_index = task.last_completed_index if task.last_completed_index is not None else -1
-        bg_task = asyncio.create_task(
-            expand_worker(task.id, cancel_event, resume_from_index=resume_from_index)
-        )
-        active_tasks[task.id] = bg_task
-        logger.info(
-            f"Dispatched queued task {task.id} for novel {task.novel_id} "
-            f"(resume_from_index={resume_from_index})"
-        )
+        if active_tasks:
+            return None
+        async with async_session() as db:
+            running_result = await db.execute(
+                select(ExpandTask.id).where(ExpandTask.status == "running").limit(1)
+            )
+            if running_result.scalar_one_or_none():
+                return None
+
+            stmt = (
+                select(ExpandTask)
+                .where(ExpandTask.status == "queued")
+                .order_by(ExpandTask.created_at.asc(), ExpandTask.id.asc())
+                .limit(1)
+            )
+            result = await db.execute(stmt)
+            task = result.scalar_one_or_none()
+            if not task:
+                return None
+
+            task.status = "running"
+            task.updated_at = datetime.utcnow()
+            await db.commit()
+            await db.refresh(task)
+
+            cancel_event = asyncio.Event()
+            cancel_events[task.id] = cancel_event
+            resume_from_index = task.last_completed_index if task.last_completed_index is not None else -1
+            bg_task = asyncio.create_task(
+                expand_worker(task.id, cancel_event, resume_from_index=resume_from_index)
+            )
+            active_tasks[task.id] = bg_task
+            logger.info(
+                f"Dispatched queued task {task.id} for novel {task.novel_id} "
+                f"(resume_from_index={resume_from_index})"
+            )
+            return task.id
 
 
 async def _queue_dispatcher_loop():
@@ -1171,7 +1186,8 @@ async def start_expand(novel_id: int, body: ExpandRequest, db: AsyncSession = De
 
     logger.info(f"Queued expand task {task.id} for novel {novel_id}")
     await _dispatch_next_task()
-    return {"task_id": task.id, "status": "queued"}
+    await db.refresh(task)
+    return {"task_id": task.id, "status": task.status}
 
 
 @app.get("/api/novels/{novel_id}/expand/stream")
@@ -1295,7 +1311,8 @@ async def resume_expand(novel_id: int, db: AsyncSession = Depends(get_db)):
 
     logger.info(f"Queued resumed task {task.id} from index {task.last_completed_index}")
     await _dispatch_next_task()
-    return {"task_id": task.id, "resumed_from_index": task.last_completed_index, "status": "queued"}
+    await db.refresh(task)
+    return {"task_id": task.id, "resumed_from_index": task.last_completed_index, "status": task.status}
 
 
 @app.post("/api/novels/{novel_id}/expand/retry-failed")
@@ -1334,7 +1351,8 @@ async def retry_failed_chapters(novel_id: int, db: AsyncSession = Depends(get_db
 
     logger.info(f"Queued retry {len(failed_ids)} failed chapters for novel {novel_id}, new task {new_task.id}")
     await _dispatch_next_task()
-    return {"task_id": new_task.id, "retrying_chapters": len(failed_ids), "status": "queued"}
+    await db.refresh(new_task)
+    return {"task_id": new_task.id, "retrying_chapters": len(failed_ids), "status": new_task.status}
 
 
 @app.post("/api/novels/{novel_id}/chapters/{chapter_id}/undo")
@@ -1711,6 +1729,10 @@ async def expand_worker(task_id: int, cancel_event: asyncio.Event, resume_from_i
             if not task:
                 logger.error(f"Task {task_id} not found")
                 return
+            if task.status != "running":
+                task.status = "running"
+                task.updated_at = datetime.utcnow()
+                await db.commit()
 
             novel_id = task.novel_id
             model = task.model
@@ -1729,11 +1751,6 @@ async def expand_worker(task_id: int, cancel_event: asyncio.Event, resume_from_i
             novel = novel_result.scalar_one_or_none()
             if novel and novel.global_summary:
                 novel_global_summary = novel.global_summary
-
-            # 更新任务状态
-            task.status = "running"
-            task.updated_at = datetime.utcnow()
-            await db.commit()
 
             # 获取章节列表
             chapter_ids = None

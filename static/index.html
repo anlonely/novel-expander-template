@@ -359,7 +359,7 @@
                         @click="startExpand"
                         :disabled="selectedChapterIds.length === 0"
                     >
-                        &#9654; 开始扩写 <span v-if="selectedChapterIds.length > 0" class="btn-badge">{{ selectedChapterIds.length }}章</span>
+                        &#9654; {{ startExpandLabel }} <span v-if="selectedChapterIds.length > 0" class="btn-badge">{{ selectedChapterIds.length }}章</span>
                     </button>
                     <button
                         v-else

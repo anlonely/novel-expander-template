@@ -215,7 +215,25 @@ const app = createApp({
 
         const latestRunningTask = computed(() => {
             const tasks = taskHistory.value || [];
-            return tasks.find(task => task.status === 'queued' || task.status === 'running') || null;
+            return tasks.find(task => task.status === 'queued' || task.status === 'running' || task.status === 'paused') || null;
+        });
+
+        const currentNovelRunningTask = computed(() => {
+            const tasks = taskHistory.value || [];
+            return tasks.find(task => task.status === 'running') || null;
+        });
+
+        const globalRunningTask = computed(() => {
+            const tasks = queueTasks.value || [];
+            return tasks.find(task => task.status === 'running') || null;
+        });
+
+        const hasOtherNovelRunning = computed(() => {
+            return !!(globalRunningTask.value && globalRunningTask.value.novel_id !== currentNovel.value?.id);
+        });
+
+        const startExpandLabel = computed(() => {
+            return hasOtherNovelRunning.value ? '加入队列' : '开始扩写';
         });
 
         const latestFailedTask = computed(() => {
@@ -402,8 +420,45 @@ const app = createApp({
                 if (!res.ok) return;
                 const data = await res.json();
                 queueTasks.value = data.tasks || [];
+                syncCurrentNovelTaskFromQueue();
             } catch (err) {
                 console.warn('Failed to load queue tasks:', err);
+            }
+        }
+
+        function syncCurrentNovelTaskFromQueue() {
+            if (!currentNovel.value) return;
+            const task = (queueTasks.value || []).find(
+                item => item.novel_id === currentNovel.value.id && item.status === 'running'
+            );
+            if (task) {
+                const alreadyTracking = isExpanding.value && expandTaskId.value === task.id && sseConnection;
+                expandTaskId.value = task.id;
+                isExpanding.value = true;
+                isExpandingCurrent.value = false;
+                isRetryingFailed.value = false;
+                totalChapters.value = task.total_chapters || totalChapters.value || 0;
+                completedChapters.value = task.completed_chapters || 0;
+                failedChaptersCount.value = task.failed_chapters || 0;
+                skippedChaptersCount.value = task.skipped_chapters || 0;
+                overallProgress.value = Math.round((task.progress || 0) * 1000) / 10;
+                currentExpandingChapter.value = task.current_chapter_title || currentExpandingChapter.value || '';
+                if (!expandStartTime.value && task.created_at) {
+                    expandStartTime.value = new Date(task.created_at).getTime();
+                }
+                if (!alreadyTracking) {
+                    addLog(`当前小说任务 #${task.id} 已开始运行`, 'info');
+                    connectSSE(currentNovel.value.id);
+                }
+                return;
+            }
+
+            const currentTask = expandTaskId.value
+                ? (queueTasks.value || []).find(item => item.id === expandTaskId.value)
+                : null;
+            if (currentTask && !['queued', 'running', 'paused'].includes(currentTask.status)) {
+                isExpanding.value = false;
+                isExpandingCurrent.value = false;
             }
         }
 
@@ -452,7 +507,7 @@ const app = createApp({
         }
 
         function restoreRunningTaskFromHistory(novelId) {
-            const runningTask = latestRunningTask.value;
+            const runningTask = currentNovelRunningTask.value;
             if (!runningTask) {
                 if (currentNovel.value?.id === novelId) {
                     isExpanding.value = false;
@@ -484,7 +539,7 @@ const app = createApp({
         async function refreshRunningTaskState() {
             if (!currentNovel.value) return false;
             await loadTaskHistory(currentNovel.value.id);
-            return !!latestRunningTask.value;
+            return !!currentNovelRunningTask.value;
         }
 
         function cleanupDismissedTaskFlags() {
@@ -723,7 +778,6 @@ const app = createApp({
             showExpandConfirm.value = false;
             expandEstimate.value = null;
 
-            isExpanding.value = true;
             overallProgress.value = 0;
             completedChapters.value = 0;
             failedChaptersCount.value = 0;
@@ -756,11 +810,14 @@ const app = createApp({
                 expandTaskId.value = data.task_id;
                 isRetryingFailed.value = false;
                 await loadQueueTasks();
+                const isRunningNow = data.status === 'running';
+                isExpanding.value = isRunningNow;
                 addLog('扩写任务已创建', 'info');
-                addNotification('扩写任务已开始', 'info');
+                addNotification(isRunningNow ? '扩写任务已开始' : '任务已加入队列', 'info');
 
-                // Connect SSE for progress
-                connectSSE(currentNovel.value.id);
+                if (isRunningNow) {
+                    connectSSE(currentNovel.value.id);
+                }
             } catch (err) {
                 const restored = await refreshRunningTaskState();
                 isExpanding.value = restored;
@@ -776,23 +833,19 @@ const app = createApp({
                 addNotification('请先选择章节', 'warning');
                 return;
             }
-            if (isExpanding.value || latestRunningTask.value) {
+            if (latestRunningTask.value) {
                 await refreshRunningTaskState();
                 if (latestRunningTask.value) {
                     addNotification('当前小说已有扩写任务，请先等待完成或取消当前任务', 'warning');
                     return;
                 }
             }
-            if (latestRunningTask.value) {
-                addNotification('当前小说已有扩写任务，请先等待完成或取消当前任务', 'warning');
-                return;
-            }
 
             const chapterId = currentChapter.value.id;
             const useExpandedBase = !forceOriginal && hasExpanded.value;
 
-            isExpandingCurrent.value = true;
-            isExpanding.value = true;
+            isExpandingCurrent.value = false;
+            isExpanding.value = false;
             overallProgress.value = 0;
             completedChapters.value = 0;
             failedChaptersCount.value = 0;
@@ -826,10 +879,20 @@ const app = createApp({
                 expandTaskId.value = data.task_id;
                 isRetryingFailed.value = false;
                 await loadQueueTasks();
+                const isRunningNow = data.status === 'running';
+                isExpanding.value = isRunningNow;
+                isExpandingCurrent.value = isRunningNow;
                 addLog(useExpandedBase ? '继续扩写任务已创建（基于已扩写内容）' : '扩写任务已创建', 'info');
-                addNotification(useExpandedBase ? '继续扩写已开始' : '扩写已开始', 'info');
+                addNotification(
+                    isRunningNow
+                        ? (useExpandedBase ? '继续扩写已开始' : '扩写已开始')
+                        : '任务已加入队列',
+                    'info'
+                );
 
-                connectSSE(currentNovel.value.id);
+                if (isRunningNow) {
+                    connectSSE(currentNovel.value.id);
+                }
             } catch (err) {
                 const restored = await refreshRunningTaskState();
                 isExpanding.value = restored;
@@ -895,7 +958,6 @@ const app = createApp({
                 }
                 const data = await res.json();
                 expandTaskId.value = data.task_id;
-                isExpanding.value = true;
                 isRetryingFailed.value = true;
                 if (latestFailedTask.value?.id) {
                     localStorage.setItem(`${DISMISSED_FAILED_PREFIX}${latestFailedTask.value.id}`, '1');
@@ -909,9 +971,18 @@ const app = createApp({
                 progressLogs.value = [];
                 expandStartTime.value = Date.now();
                 addLog(`正在重试 ${data.retrying_chapters} 个失败章节`, 'info');
-                addNotification(`正在重试 ${data.retrying_chapters} 个失败章节`, 'info');
                 await loadQueueTasks();
-                connectSSE(currentNovel.value.id);
+                const isRunningNow = data.status === 'running';
+                isExpanding.value = isRunningNow;
+                addNotification(
+                    isRunningNow
+                        ? `正在重试 ${data.retrying_chapters} 个失败章节`
+                        : `已加入队列：重试 ${data.retrying_chapters} 个失败章节`,
+                    'info'
+                );
+                if (isRunningNow) {
+                    connectSSE(currentNovel.value.id);
+                }
             } catch (err) {
                 isRetryingFailed.value = false;
                 addNotification('重试失败: ' + err.message, 'error');
@@ -972,7 +1043,8 @@ const app = createApp({
                 }
                 const data = await res.json();
                 expandTaskId.value = data.task_id;
-                isExpanding.value = true;
+                const isRunningNow = data.status === 'running';
+                isExpanding.value = isRunningNow;
                 overallProgress.value = 0;
                 completedChapters.value = interruptedTask.value.completed_chapters || 0;
                 failedChaptersCount.value = interruptedTask.value.failed_chapters || 0;
@@ -982,11 +1054,13 @@ const app = createApp({
                 progressLogs.value = [];
                 expandStartTime.value = Date.now();
                 addLog(`从第 ${data.resumed_from_index + 1} 章继续扩写`, 'info');
-                addNotification('已恢复中断的扩写任务', 'info');
+                addNotification(isRunningNow ? '已恢复中断的扩写任务' : '恢复任务已加入队列', 'info');
                 localStorage.removeItem(`${DISMISSED_INTERRUPTED_PREFIX}${data.task_id}`);
                 interruptedTask.value = null;
                 await loadQueueTasks();
-                connectSSE(currentNovel.value.id);
+                if (isRunningNow) {
+                    connectSSE(currentNovel.value.id);
+                }
             } catch (err) {
                 addNotification('恢复任务失败: ' + err.message, 'error');
             }
@@ -2197,6 +2271,7 @@ const app = createApp({
             latestFailedTask,
             showFailedTaskAlert,
             tokenWarning,
+            startExpandLabel,
 
             // Methods
             loadNovels,
@@ -2225,6 +2300,7 @@ const app = createApp({
             dismissFailedAlert,
             loadTaskHistory,
             loadQueueTasks,
+            syncCurrentNovelTaskFromQueue,
             showChapterRewriteInstruction,
             submitChapterRewriteInstruction,
             cancelChapterRewriteInstruction,
