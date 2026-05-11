@@ -36,6 +36,8 @@ async def migrate_db():
         ("expand_tasks", "last_completed_index", "INTEGER DEFAULT -1"),
         ("expand_tasks", "failed_chapter_ids_json", "TEXT"),
         ("expand_tasks", "quality", "TEXT DEFAULT 'balanced'"),
+        ("expand_tasks", "queue_priority", "INTEGER DEFAULT 0"),
+        ("expand_tasks", "queued_at", "DATETIME"),
     ]
 
     async with engine.begin() as conn:

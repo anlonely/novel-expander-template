@@ -215,7 +215,7 @@ const app = createApp({
 
         const latestRunningTask = computed(() => {
             const tasks = taskHistory.value || [];
-            return tasks.find(task => task.status === 'queued' || task.status === 'running' || task.status === 'paused') || null;
+            return tasks.find(task => ['queued', 'running', 'pausing', 'paused'].includes(task.status)) || null;
         });
 
         const currentNovelRunningTask = computed(() => {
@@ -225,7 +225,7 @@ const app = createApp({
 
         const globalRunningTask = computed(() => {
             const tasks = queueTasks.value || [];
-            return tasks.find(task => task.status === 'running') || null;
+            return tasks.find(task => task.status === 'running' || task.status === 'pausing') || null;
         });
 
         const hasOtherNovelRunning = computed(() => {
@@ -456,7 +456,7 @@ const app = createApp({
             const currentTask = expandTaskId.value
                 ? (queueTasks.value || []).find(item => item.id === expandTaskId.value)
                 : null;
-            if (currentTask && !['queued', 'running', 'paused'].includes(currentTask.status)) {
+            if (currentTask && !['queued', 'running', 'pausing', 'paused'].includes(currentTask.status)) {
                 isExpanding.value = false;
                 isExpandingCurrent.value = false;
             }
@@ -1947,10 +1947,20 @@ const app = createApp({
                 cancelled: '已取消',
                 interrupted: '已中断',
                 running: '运行中',
+                pausing: '暂停中',
                 queued: '排队中',
                 paused: '已暂停',
             };
             return map[task?.status] || (task?.status || '');
+        }
+
+        function taskStatusClass(task) {
+            return task?.status ? `task-${task.status}` : '';
+        }
+
+        function taskProgressPercent(task) {
+            const raw = Number(task?.progress || 0) * 100;
+            return Math.max(0, Math.min(100, Math.round(raw * 10) / 10));
         }
 
         function formatDate(dateStr) {
@@ -2351,6 +2361,8 @@ const app = createApp({
             chapterStatusIcon,
             chapterStatusText,
             taskStatusText,
+            taskStatusClass,
+            taskProgressPercent,
             formatDate,
             formatDuration,
             formatWordCount,

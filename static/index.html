@@ -419,7 +419,7 @@
                     <span class="text-muted">{{ queueTasks.length }}</span>
                 </div>
                 <div class="task-history-list">
-                    <div v-for="task in queueTasks" :key="'q-' + task.id" class="task-history-item">
+                    <div v-for="task in queueTasks" :key="'q-' + task.id" class="task-history-item" :class="taskStatusClass(task)">
                         <div class="task-history-top">
                             <span>#{{ task.id }} {{ taskStatusText(task) }} · {{ task.novel_title || ('小说' + task.novel_id) }}</span>
                             <span class="text-muted">{{ formatDate(task.created_at) }}</span>
@@ -427,7 +427,10 @@
                         <div class="task-history-meta">
                             {{ task.model }} · {{ task.completed_chapters }}/{{ task.total_chapters }}完成 · {{ formatDuration(task.duration_seconds) }}
                         </div>
-                        <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
+                        <div class="task-mini-progress">
+                            <div class="task-mini-progress-fill" :style="{ width: taskProgressPercent(task) + '%' }"></div>
+                        </div>
+                        <div class="task-actions">
                             <button class="btn btn-ghost btn-sm" @click="prioritizeTask(task.id)" :disabled="task.status !== 'queued'">置顶</button>
                             <button class="btn btn-ghost btn-sm" @click="pauseQueueTask(task.id)" :disabled="!(task.status === 'queued' || task.status === 'running')">暂停</button>
                             <button class="btn btn-ghost btn-sm" @click="resumeQueueTask(task.id)" :disabled="task.status !== 'paused'">恢复</button>

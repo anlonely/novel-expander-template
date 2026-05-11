@@ -54,7 +54,7 @@ class ExpandTask(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     novel_id = Column(Integer, ForeignKey("novels.id"), nullable=False)
     status = Column(String(50), default="queued")
-    # queued, running, completed, failed, cancelled, interrupted
+    # queued, running, pausing, paused, completed, failed, cancelled, interrupted
     model = Column(String(100), default="grok-4.20-auto")
     mode = Column(String(50), default="one_pass")  # one_pass, detailed
     quality = Column(String(50), default="balanced")  # balanced, nuanced, unleashed
@@ -72,6 +72,9 @@ class ExpandTask(Base):
     last_completed_index = Column(Integer, default=-1)
     # 失败的章节 ID 列表（JSON 数组）
     failed_chapter_ids_json = Column(Text, nullable=True)
+    # Queue ordering. Larger values run first; created_at remains the real enqueue time.
+    queue_priority = Column(Integer, default=0)
+    queued_at = Column(DateTime, default=datetime.utcnow)
     error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
