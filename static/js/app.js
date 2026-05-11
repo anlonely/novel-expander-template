@@ -53,6 +53,7 @@ const app = createApp({
         // UI state
         const showUploadModal = ref(false);
         const showSettingsModal = ref(false);
+        const showExportModal = ref(false);
         const showPromptSettingsModal = ref(false);
         const showDeleteConfirm = ref(false);
         const deleteTarget = ref(null);
@@ -64,6 +65,7 @@ const app = createApp({
         const exportFormat = ref('txt');
         const exportSeparatorStyle = ref('classic');
         const showTaskHistory = ref(true);
+        const queueTasks = ref([]);
 
         // API Profiles
         const apiProfiles = ref([]);
@@ -84,7 +86,10 @@ const app = createApp({
 
         // SSE connection
         let sseConnection = null;
+        let sseNovelId = null;
+        let postTaskRefreshTimer = null;
         let expectedSseClose = false;
+        let queueRefreshTimer = null;
 
         // Notifications
         const notifications = ref([]);
@@ -345,6 +350,10 @@ const app = createApp({
 
         async function selectNovel(novel) {
             if (currentNovel.value && currentNovel.value.id === novel.id) return;
+            disconnectSSE();
+            isExpanding.value = false;
+            isExpandingCurrent.value = false;
+            expandTaskId.value = null;
             currentNovel.value = novel;
             console.log('[selectNovel] Selected novel ID:', novel.id);
             currentChapter.value = null;
@@ -388,9 +397,70 @@ const app = createApp({
             }
         }
 
+        async function loadQueueTasks() {
+            try {
+                const res = await fetch(apiUrl('/api/tasks/queue'), { headers: apiHeaders() });
+                if (!res.ok) return;
+                const data = await res.json();
+                queueTasks.value = data.tasks || [];
+            } catch (err) {
+                console.warn('Failed to load queue tasks:', err);
+            }
+        }
+
+        async function prioritizeTask(taskId) {
+            try {
+                const res = await fetch(apiUrl(`/api/tasks/${taskId}/prioritize`), { method: 'POST', headers: apiHeaders() });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                await loadQueueTasks();
+                addNotification('任务已置顶', 'success');
+            } catch (err) {
+                addNotification('置顶失败: ' + err.message, 'error');
+            }
+        }
+
+        async function pauseQueueTask(taskId) {
+            try {
+                const res = await fetch(apiUrl(`/api/tasks/${taskId}/pause`), { method: 'POST', headers: apiHeaders() });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                await loadQueueTasks();
+                addNotification('已请求暂停任务', 'warning');
+            } catch (err) {
+                addNotification('暂停失败: ' + err.message, 'error');
+            }
+        }
+
+        async function resumeQueueTask(taskId) {
+            try {
+                const res = await fetch(apiUrl(`/api/tasks/${taskId}/resume`), { method: 'POST', headers: apiHeaders() });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                await loadQueueTasks();
+                addNotification('任务已恢复并入队', 'success');
+            } catch (err) {
+                addNotification('恢复失败: ' + err.message, 'error');
+            }
+        }
+
+        async function cancelTaskById(taskId) {
+            try {
+                const res = await fetch(apiUrl(`/api/tasks/${taskId}/cancel`), { method: 'POST', headers: apiHeaders() });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                await loadQueueTasks();
+                addNotification('任务已取消', 'warning');
+            } catch (err) {
+                addNotification('取消失败: ' + err.message, 'error');
+            }
+        }
+
         function restoreRunningTaskFromHistory(novelId) {
             const runningTask = latestRunningTask.value;
-            if (!runningTask) return;
+            if (!runningTask) {
+                if (currentNovel.value?.id === novelId) {
+                    isExpanding.value = false;
+                    isExpandingCurrent.value = false;
+                }
+                return;
+            }
 
             const alreadyTracking = isExpanding.value && expandTaskId.value === runningTask.id && sseConnection;
             expandTaskId.value = runningTask.id;
@@ -686,6 +756,7 @@ const app = createApp({
                 const data = await res.json();
                 expandTaskId.value = data.task_id;
                 isRetryingFailed.value = false;
+                await loadQueueTasks();
                 addLog('扩写任务已创建', 'info');
                 addNotification('扩写任务已开始', 'info');
 
@@ -708,7 +779,13 @@ const app = createApp({
             }
             if (isExpanding.value || latestRunningTask.value) {
                 await refreshRunningTaskState();
-                addNotification('已有扩写任务正在运行，请先等待完成或取消当前任务', 'warning');
+                if (latestRunningTask.value) {
+                    addNotification('当前小说已有扩写任务，请先等待完成或取消当前任务', 'warning');
+                    return;
+                }
+            }
+            if (latestRunningTask.value) {
+                addNotification('当前小说已有扩写任务，请先等待完成或取消当前任务', 'warning');
                 return;
             }
 
@@ -749,6 +826,7 @@ const app = createApp({
                 const data = await res.json();
                 expandTaskId.value = data.task_id;
                 isRetryingFailed.value = false;
+                await loadQueueTasks();
                 addLog(useExpandedBase ? '继续扩写任务已创建（基于已扩写内容）' : '扩写任务已创建', 'info');
                 addNotification(useExpandedBase ? '继续扩写已开始' : '扩写已开始', 'info');
 
@@ -791,6 +869,7 @@ const app = createApp({
                     await loadTaskHistory(currentNovel.value.id);
                     await refreshNovelDetail(currentNovel.value.id);
                 }
+                await loadQueueTasks();
                 addNotification('已发送取消请求', 'warning');
                 addLog('已发送取消请求', 'warning');
             } catch (err) {
@@ -832,6 +911,7 @@ const app = createApp({
                 expandStartTime.value = Date.now();
                 addLog(`正在重试 ${data.retrying_chapters} 个失败章节`, 'info');
                 addNotification(`正在重试 ${data.retrying_chapters} 个失败章节`, 'info');
+                await loadQueueTasks();
                 connectSSE(currentNovel.value.id);
             } catch (err) {
                 isRetryingFailed.value = false;
@@ -906,6 +986,7 @@ const app = createApp({
                 addNotification('已恢复中断的扩写任务', 'info');
                 localStorage.removeItem(`${DISMISSED_INTERRUPTED_PREFIX}${data.task_id}`);
                 interruptedTask.value = null;
+                await loadQueueTasks();
                 connectSSE(currentNovel.value.id);
             } catch (err) {
                 addNotification('恢复任务失败: ' + err.message, 'error');
@@ -929,10 +1010,17 @@ const app = createApp({
         // ==================== SSE - Expand Progress ====================
 
         function connectSSE(novelId) {
+            if (!novelId) return;
+            // Single-connection guard: avoid reconnect storms for the same novel.
+            if (sseConnection && sseNovelId === novelId && sseConnection.readyState !== EventSource.CLOSED) {
+                return;
+            }
+
             disconnectSSE();
             const url = apiUrl(`/api/novels/${novelId}/expand/stream`);
             const es = new EventSource(url);
             sseConnection = es;
+            sseNovelId = novelId;
             sseReconnecting.value = false;
             expectedSseClose = false;
 
@@ -1037,13 +1125,21 @@ const app = createApp({
                     );
                 }
 
-                // Refresh data
-                loadNovels();
-                if (currentNovel.value) {
-                    refreshNovelDetail(currentNovel.value.id);
-                    checkInterruptedTask();
-                    loadTaskHistory(currentNovel.value.id);
+                // Refresh data with debounce to avoid burst polling.
+                if (postTaskRefreshTimer) {
+                    clearTimeout(postTaskRefreshTimer);
+                    postTaskRefreshTimer = null;
                 }
+                postTaskRefreshTimer = setTimeout(() => {
+                    loadNovels();
+                    if (currentNovel.value) {
+                        refreshNovelDetail(currentNovel.value.id);
+                        checkInterruptedTask();
+                        loadTaskHistory(currentNovel.value.id);
+                    }
+                    loadQueueTasks();
+                    postTaskRefreshTimer = null;
+                }, 300);
                 // Refresh current chapter to show expanded content
                 if (currentChapter.value) {
                     refreshCurrentChapter().then(() => {
@@ -1092,6 +1188,7 @@ const app = createApp({
                 sseConnection.close();
                 sseConnection = null;
             }
+            sseNovelId = null;
             sseReconnecting.value = false;
         }
 
@@ -1778,6 +1875,7 @@ const app = createApp({
                 interrupted: '已中断',
                 running: '运行中',
                 queued: '排队中',
+                paused: '已暂停',
             };
             return map[task?.status] || (task?.status || '');
         }
@@ -1993,6 +2091,8 @@ const app = createApp({
             loadSettings();
             loadNovels();
             loadProfiles();
+            loadQueueTasks();
+            queueRefreshTimer = setInterval(loadQueueTasks, 5000);
             window.addEventListener('keydown', handleGlobalKeydown);
             window.addEventListener('resize', syncMobileLayout);
         });
@@ -2003,6 +2103,10 @@ const app = createApp({
 
         onUnmounted(() => {
             disconnectSSE();
+            if (queueRefreshTimer) {
+                clearInterval(queueRefreshTimer);
+                queueRefreshTimer = null;
+            }
             window.removeEventListener('keydown', handleGlobalKeydown);
             window.removeEventListener('resize', syncMobileLayout);
         });
@@ -2041,6 +2145,7 @@ const app = createApp({
             isChapterRewriting,
             showUploadModal,
             showSettingsModal,
+            showExportModal,
             showPromptSettingsModal,
             showDeleteConfirm,
             deleteTarget,
@@ -2073,6 +2178,7 @@ const app = createApp({
             manualEditText,
             sseReconnecting,
             showTaskHistory,
+            queueTasks,
 
             // Computed
             displayParagraphs,
@@ -2120,6 +2226,7 @@ const app = createApp({
             dismissInterrupted,
             dismissFailedAlert,
             loadTaskHistory,
+            loadQueueTasks,
             showChapterRewriteInstruction,
             submitChapterRewriteInstruction,
             cancelChapterRewriteInstruction,
@@ -2132,6 +2239,10 @@ const app = createApp({
             isChapterSelected,
             applyChapterRange,
             exportNovel,
+            prioritizeTask,
+            pauseQueueTask,
+            resumeQueueTask,
+            cancelTaskById,
             fetchTokenStatus,
             loadProfiles,
             addNewProfile,

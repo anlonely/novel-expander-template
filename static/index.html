@@ -45,6 +45,9 @@
             <button class="btn btn-ghost btn-sm desktop-action" @click="exportNovel" :disabled="!currentNovel">
                 &#128229; 导出
             </button>
+            <button class="btn btn-ghost btn-sm desktop-action" @click="showExportModal = true">
+                &#9881; 导出设置
+            </button>
             <button class="btn btn-ghost btn-sm desktop-action" @click="openPromptSettingsModal">
                 &#129504; 提示词
             </button>
@@ -432,20 +435,31 @@
                 </div>
             </div>
 
-            <!-- Export (compact) -->
-            <div class="panel-section panel-compact">
-                <div class="config-row">
-                    <span class="config-label">导出</span>
-                    <select class="config-select" v-model="exportFormat">
-                        <option value="txt">TXT</option>
-                        <option value="docx">DOCX</option>
-                        <option value="epub">EPUB</option>
-                    </select>
-                    <select class="config-select" v-if="exportFormat === 'txt'" v-model="exportSeparatorStyle" style="margin-left: 6px;">
-                        <option value="classic">经典分隔</option>
-                        <option value="minimal">最简</option>
-                        <option value="double">加粗</option>
-                    </select>
+            <!-- 4. Global Queue -->
+            <div class="panel-section panel-history">
+                <div class="panel-section-title">
+                    <span>任务队列</span>
+                    <span class="text-muted">{{ queueTasks.length }}</span>
+                </div>
+                <div class="task-history-list">
+                    <div v-for="task in queueTasks" :key="'q-' + task.id" class="task-history-item">
+                        <div class="task-history-top">
+                            <span>#{{ task.id }} {{ taskStatusText(task) }} · {{ task.novel_title || ('小说' + task.novel_id) }}</span>
+                            <span class="text-muted">{{ formatDate(task.created_at) }}</span>
+                        </div>
+                        <div class="task-history-meta">
+                            {{ task.model }} · {{ task.completed_chapters }}/{{ task.total_chapters }}完成
+                        </div>
+                        <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
+                            <button class="btn btn-ghost btn-sm" @click="prioritizeTask(task.id)" :disabled="task.status !== 'queued'">置顶</button>
+                            <button class="btn btn-ghost btn-sm" @click="pauseQueueTask(task.id)" :disabled="!(task.status === 'queued' || task.status === 'running')">暂停</button>
+                            <button class="btn btn-ghost btn-sm" @click="resumeQueueTask(task.id)" :disabled="task.status !== 'paused'">恢复</button>
+                            <button class="btn btn-danger btn-sm" @click="cancelTaskById(task.id)" :disabled="task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'">取消</button>
+                        </div>
+                    </div>
+                    <div v-if="queueTasks.length === 0" class="text-muted task-history-empty">
+                        队列为空
+                    </div>
                 </div>
             </div>
 
@@ -463,6 +477,36 @@
         v-if="isMobileLayout && (!leftCollapsed || !rightCollapsed)"
         @click="closeMobilePanels"
     ></div>
+
+    <!-- ==================== Export Modal ==================== -->
+    <div class="modal-overlay" v-if="showExportModal" @click.self="showExportModal = false">
+        <div class="modal-box">
+            <div class="modal-title">
+                导出设置
+                <button class="modal-close" @click="showExportModal = false">&times;</button>
+            </div>
+            <div class="config-row">
+                <span class="config-label">格式</span>
+                <select class="config-select" v-model="exportFormat">
+                    <option value="txt">TXT</option>
+                    <option value="docx">DOCX</option>
+                    <option value="epub">EPUB</option>
+                </select>
+            </div>
+            <div class="config-row" v-if="exportFormat === 'txt'">
+                <span class="config-label">分隔</span>
+                <select class="config-select" v-model="exportSeparatorStyle">
+                    <option value="classic">经典分隔</option>
+                    <option value="minimal">最简</option>
+                    <option value="double">加粗</option>
+                </select>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-ghost" @click="showExportModal = false">关闭</button>
+                <button class="btn btn-primary" @click="exportNovel" :disabled="!currentNovel">立即导出</button>
+            </div>
+        </div>
+    </div>
 
     <nav class="mobile-bottom-nav">
         <button class="mobile-nav-btn" :class="{ active: leftCollapsed && rightCollapsed }" @click="showReadingPanel">

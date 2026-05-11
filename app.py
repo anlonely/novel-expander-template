@@ -69,6 +69,8 @@ cancel_events: Dict[int, asyncio.Event] = {}
 
 # 活跃任务: task_id -> asyncio.Task
 active_tasks: Dict[int, asyncio.Task] = {}
+queue_dispatcher_task: Optional[asyncio.Task] = None
+pause_requests: set[int] = set()
 
 # 进度写库节流：上次写库时间戳
 _last_progress_db_write = 0.0
@@ -114,11 +116,11 @@ def _is_secure_request(request: Request) -> bool:
 
 
 async def _find_live_task_for_novel(db: AsyncSession, novel_id: int) -> Optional[ExpandTask]:
-    """返回当前小说真正仍在运行的任务；清理残留的僵尸 running/queued 任务。"""
+    """Return an active task for this novel without breaking queued/paused work."""
     stmt = (
         select(ExpandTask)
         .where(ExpandTask.novel_id == novel_id)
-        .where(ExpandTask.status.in_(["queued", "running"]))
+        .where(ExpandTask.status.in_(["queued", "running", "paused"]))
         .order_by(ExpandTask.created_at.desc())
     )
     result = await db.execute(stmt)
@@ -126,12 +128,16 @@ async def _find_live_task_for_novel(db: AsyncSession, novel_id: int) -> Optional
 
     live_task = None
     for task in tasks:
+        if task.status in {"queued", "paused"}:
+            live_task = task
+            continue
+
         bg_task = active_tasks.get(task.id)
         if bg_task and not bg_task.done():
             live_task = task
             continue
 
-        if task.status in {"queued", "running"}:
+        if task.status == "running":
             task.status = "interrupted"
             if not task.error_message:
                 task.error_message = "Stale task auto-marked interrupted"
@@ -140,6 +146,47 @@ async def _find_live_task_for_novel(db: AsyncSession, novel_id: int) -> Optional
     if tasks:
         await db.commit()
     return live_task
+
+
+async def _dispatch_next_task():
+    for task_id, task in list(active_tasks.items()):
+        if task.done():
+            active_tasks.pop(task_id, None)
+            cancel_events.pop(task_id, None)
+
+    if active_tasks:
+        return
+    async with async_session() as db:
+        stmt = (
+            select(ExpandTask)
+            .where(ExpandTask.status == "queued")
+            .order_by(ExpandTask.created_at.asc(), ExpandTask.id.asc())
+            .limit(1)
+        )
+        result = await db.execute(stmt)
+        task = result.scalar_one_or_none()
+        if not task:
+            return
+        cancel_event = asyncio.Event()
+        cancel_events[task.id] = cancel_event
+        resume_from_index = task.last_completed_index if task.last_completed_index is not None else -1
+        bg_task = asyncio.create_task(
+            expand_worker(task.id, cancel_event, resume_from_index=resume_from_index)
+        )
+        active_tasks[task.id] = bg_task
+        logger.info(
+            f"Dispatched queued task {task.id} for novel {task.novel_id} "
+            f"(resume_from_index={resume_from_index})"
+        )
+
+
+async def _queue_dispatcher_loop():
+    while True:
+        try:
+            await _dispatch_next_task()
+        except Exception as e:
+            logger.error(f"queue dispatcher loop error: {e}", exc_info=True)
+        await asyncio.sleep(0.8)
 
 
 def _is_fatal_api_error(error: Exception) -> bool:
@@ -285,6 +332,7 @@ def _task_history_item(task: ExpandTask) -> Dict[str, object]:
 
     return {
         "id": task.id,
+        "novel_id": task.novel_id,
         "status": task.status,
         "model": task.model,
         "mode": task.mode,
@@ -525,12 +573,13 @@ async def lifespan(app):
     await init_db()
     await migrate_db()  # 数据库迁移：为已有表添加新增列
     settings_manager.init_settings()  # 加载运行时设置
+    global queue_dispatcher_task
 
     # 将中断的任务标记为 interrupted（不是 failed，方便恢复）
     async with async_session() as db:
         stmt = (
             update(ExpandTask)
-            .where(ExpandTask.status.in_(["queued", "running"]))
+            .where(ExpandTask.status == "running")
             .values(status="interrupted", error_message="Server restarted")
         )
         await db.execute(stmt)
@@ -543,6 +592,8 @@ async def lifespan(app):
         )
         await db.execute(stmt2)
         await db.commit()
+
+    queue_dispatcher_task = asyncio.create_task(_queue_dispatcher_loop())
 
     # 清理旧导出文件
     export_dir = os.path.join(config.DATA_DIR, "exports")
@@ -559,6 +610,8 @@ async def lifespan(app):
 
     # === shutdown — 优雅停机 ===
     logger.info("Shutting down, cancelling active tasks...")
+    if queue_dispatcher_task:
+        queue_dispatcher_task.cancel()
     for task_id, cancel_evt in list(cancel_events.items()):
         cancel_evt.set()
     # 等待活跃任务结束（最多10秒）
@@ -1086,7 +1139,7 @@ async def start_expand(novel_id: int, body: ExpandRequest, db: AsyncSession = De
     # 检查是否已有运行中的任务
     live_task = await _find_live_task_for_novel(db, novel_id)
     if live_task:
-        raise HTTPException(status_code=409, detail="An expand task is already running for this novel")
+        raise HTTPException(status_code=409, detail="An expand task is already queued, paused, or running for this novel")
 
     # 确定要处理的章节
     chapter_ids_json = None
@@ -1116,17 +1169,9 @@ async def start_expand(novel_id: int, body: ExpandRequest, db: AsyncSession = De
     await db.commit()
     await db.refresh(task)
 
-    # 创建取消事件
-    cancel_event = asyncio.Event()
-    cancel_events[task.id] = cancel_event
-
-    # 启动后台任务
-    bg_task = asyncio.create_task(expand_worker(task.id, cancel_event))
-    active_tasks[task.id] = bg_task
-
-    logger.info(f"Started expand task {task.id} for novel {novel_id}")
-
-    return {"task_id": task.id}
+    logger.info(f"Queued expand task {task.id} for novel {novel_id}")
+    await _dispatch_next_task()
+    return {"task_id": task.id, "status": "queued"}
 
 
 @app.get("/api/novels/{novel_id}/expand/stream")
@@ -1242,24 +1287,15 @@ async def resume_expand(novel_id: int, db: AsyncSession = Depends(get_db)):
     if not task:
         raise HTTPException(status_code=404, detail="No interrupted task found")
 
-    # 重置状态
-    task.status = "running"
+    # 重置状态并排队
+    task.status = "queued"
     task.error_message = None
     await db.commit()
     await db.refresh(task)
 
-    cancel_event = asyncio.Event()
-    cancel_events[task.id] = cancel_event
-
-    # 从断点恢复
-    bg_task = asyncio.create_task(
-        expand_worker(task.id, cancel_event, resume_from_index=task.last_completed_index)
-    )
-    active_tasks[task.id] = bg_task
-
-    logger.info(f"Resumed task {task.id} from index {task.last_completed_index}")
-
-    return {"task_id": task.id, "resumed_from_index": task.last_completed_index}
+    logger.info(f"Queued resumed task {task.id} from index {task.last_completed_index}")
+    await _dispatch_next_task()
+    return {"task_id": task.id, "resumed_from_index": task.last_completed_index, "status": "queued"}
 
 
 @app.post("/api/novels/{novel_id}/expand/retry-failed")
@@ -1296,14 +1332,9 @@ async def retry_failed_chapters(novel_id: int, db: AsyncSession = Depends(get_db
     await db.commit()
     await db.refresh(new_task)
 
-    cancel_event = asyncio.Event()
-    cancel_events[new_task.id] = cancel_event
-    bg_task = asyncio.create_task(expand_worker(new_task.id, cancel_event))
-    active_tasks[new_task.id] = bg_task
-
-    logger.info(f"Retrying {len(failed_ids)} failed chapters for novel {novel_id}, new task {new_task.id}")
-
-    return {"task_id": new_task.id, "retrying_chapters": len(failed_ids)}
+    logger.info(f"Queued retry {len(failed_ids)} failed chapters for novel {novel_id}, new task {new_task.id}")
+    await _dispatch_next_task()
+    return {"task_id": new_task.id, "retrying_chapters": len(failed_ids), "status": "queued"}
 
 
 @app.post("/api/novels/{novel_id}/chapters/{chapter_id}/undo")
@@ -1432,6 +1463,94 @@ async def get_task_history(novel_id: int, limit: int = 20, db: AsyncSession = De
     result = await db.execute(stmt)
     tasks = result.scalars().all()
     return {"tasks": [_task_history_item(task) for task in tasks]}
+
+
+@app.get("/api/tasks/queue")
+async def list_global_queue(db: AsyncSession = Depends(get_db)):
+    stmt = (
+        select(ExpandTask)
+        .where(ExpandTask.status.in_(["queued", "running", "paused"]))
+        .order_by(ExpandTask.created_at.asc(), ExpandTask.id.asc())
+    )
+    result = await db.execute(stmt)
+    tasks = result.scalars().all()
+    novel_ids = {task.novel_id for task in tasks}
+    titles = {}
+    if novel_ids:
+        novels_result = await db.execute(select(Novel.id, Novel.title).where(Novel.id.in_(novel_ids)))
+        titles = {novel_id: title for novel_id, title in novels_result.all()}
+    items = []
+    for task in tasks:
+        item = _task_history_item(task)
+        item["novel_title"] = titles.get(task.novel_id, f"Novel {task.novel_id}")
+        items.append(item)
+    return {"tasks": items}
+
+
+@app.post("/api/tasks/{task_id}/prioritize")
+async def prioritize_task(task_id: int, db: AsyncSession = Depends(get_db)):
+    task = await db.get(ExpandTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status != "queued":
+        raise HTTPException(status_code=400, detail="Only queued tasks can be prioritized")
+    task.created_at = datetime.utcnow() - timedelta(days=3650)
+    task.updated_at = datetime.utcnow()
+    await db.commit()
+    await _dispatch_next_task()
+    return {"task_id": task_id, "status": "queued", "message": "prioritized"}
+
+
+@app.post("/api/tasks/{task_id}/pause")
+async def pause_task(task_id: int, db: AsyncSession = Depends(get_db)):
+    task = await db.get(ExpandTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status == "queued":
+        task.status = "paused"
+        task.updated_at = datetime.utcnow()
+        await db.commit()
+        return {"task_id": task_id, "status": "paused"}
+    if task.status == "running":
+        pause_requests.add(task_id)
+        if task_id in cancel_events:
+            cancel_events[task_id].set()
+        return {"task_id": task_id, "status": "pausing"}
+    raise HTTPException(status_code=400, detail="Task cannot be paused in current status")
+
+
+@app.post("/api/tasks/{task_id}/resume")
+async def resume_task(task_id: int, db: AsyncSession = Depends(get_db)):
+    task = await db.get(ExpandTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status != "paused":
+        raise HTTPException(status_code=400, detail="Only paused tasks can be resumed")
+    task.status = "queued"
+    task.updated_at = datetime.utcnow()
+    await db.commit()
+    await _dispatch_next_task()
+    return {"task_id": task_id, "status": "queued"}
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+async def cancel_task(task_id: int, db: AsyncSession = Depends(get_db)):
+    task = await db.get(ExpandTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status in {"completed", "failed", "cancelled"}:
+        return {"task_id": task_id, "status": task.status}
+    pause_requests.discard(task_id)
+    task.status = "cancelled"
+    task.updated_at = datetime.utcnow()
+    await db.commit()
+    if task_id in cancel_events:
+        cancel_events[task_id].set()
+    bg = active_tasks.get(task_id)
+    if bg and not bg.done():
+        bg.cancel()
+    await _dispatch_next_task()
+    return {"task_id": task_id, "status": "cancelled"}
 
 
 # ========== 重写段落/章节 路由 ==========
@@ -1722,13 +1841,15 @@ async def expand_worker(task_id: int, cancel_event: asyncio.Event, resume_from_i
                 async with async_session() as db:
                     task_obj = await db.get(ExpandTask, task_id)
                     if task_obj:
-                        task_obj.status = "cancelled"
+                        is_pause = task_id in pause_requests
+                        task_obj.status = "paused" if is_pause else "cancelled"
                         task_obj.updated_at = datetime.utcnow()
                         await db.commit()
                 await broadcast_sse(novel_id, "task_done", {
                     "task_id": task_id,
-                    "status": "cancelled",
+                    "status": "paused" if task_id in pause_requests else "cancelled",
                 })
+                pause_requests.discard(task_id)
                 return
 
             async with async_session() as db:
@@ -1740,6 +1861,15 @@ async def expand_worker(task_id: int, cancel_event: asyncio.Event, resume_from_i
                         "task_id": task_id,
                         "status": "cancelled",
                     })
+                    return
+                if task_obj and task_obj.status == "paused":
+                    logger.info(f"Task {task_id} paused from database status at chapter {ch_idx + 1}/{total_chapters}")
+                    cancel_event.set()
+                    await broadcast_sse(novel_id, "task_done", {
+                        "task_id": task_id,
+                        "status": "paused",
+                    })
+                    pause_requests.discard(task_id)
                     return
 
             logger.info(f"Task {task_id}: Processing chapter {ch_idx + 1}/{total_chapters}: {chapter_title}")
@@ -1888,10 +2018,16 @@ async def expand_worker(task_id: int, cancel_event: asyncio.Event, resume_from_i
                         async with async_session() as db2:
                             task_obj = await db2.get(ExpandTask, task_id)
                             if task_obj:
-                                task_obj.status = "cancelled"
+                                is_pause = task_id in pause_requests
+                                task_obj.status = "paused" if is_pause else "cancelled"
                                 task_obj.updated_at = datetime.utcnow()
                                 await db2.commit()
-                        await broadcast_sse(novel_id, "task_done", {"task_id": task_id, "status": "cancelled"})
+                        await broadcast_sse(
+                            novel_id,
+                            "task_done",
+                            {"task_id": task_id, "status": "paused" if task_id in pause_requests else "cancelled"},
+                        )
+                        pause_requests.discard(task_id)
                         return
 
                     # 判断是否被跳过（返回值等于输入内容说明无需扩写）
