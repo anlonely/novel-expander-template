@@ -23,8 +23,6 @@ const app = createApp({
         const viewMode = ref('original');
 
         // Expand settings
-        const expandMode = ref('one_pass');
-        const expandQuality = ref('unleashed');
         const selectedModel = ref('grok-4.20-auto');
         const selectedChapterIds = ref([]);
         const chapterRangeInput = ref('');
@@ -49,6 +47,10 @@ const app = createApp({
         const chapterRewritePromptVisible = ref(false);
         const chapterRewriteInstruction = ref('');
         const isChapterRewriting = ref(false);
+        const chapterEditorVisible = ref(false);
+        const chapterEditorTarget = ref('expanded');
+        const chapterEditorText = ref('');
+        const chapterEditorSaving = ref(false);
 
         // UI state
         const showUploadModal = ref(false);
@@ -62,6 +64,7 @@ const app = createApp({
         const leftCollapsed = ref(false);
         const rightCollapsed = ref(false);
         const isMobileLayout = ref(false);
+        const mobileNavCollapsed = ref(true);
         const exportFormat = ref('txt');
         const exportSeparatorStyle = ref('classic');
         const queueTasks = ref([]);
@@ -149,6 +152,8 @@ const app = createApp({
         const rightChapterScrollTop = ref(0);
         const leftChapterListRef = ref(null);
         const rightCheckboxListRef = ref(null);
+        const contentBodyRef = ref(null);
+        const showChapterTools = ref(false);
         const virtualRowHeight = 40;
         const virtualOverscan = 8;
 
@@ -206,6 +211,16 @@ const app = createApp({
             return !!(currentChapter.value && currentChapter.value.expanded_content_prev);
         });
 
+        const currentChapterIndex = computed(() => {
+            if (!currentChapter.value) return -1;
+            return chapters.value.findIndex(ch => ch.id === currentChapter.value.id);
+        });
+
+        const hasPreviousChapter = computed(() => currentChapterIndex.value > 0);
+        const hasNextChapter = computed(() => {
+            return currentChapterIndex.value >= 0 && currentChapterIndex.value < chapters.value.length - 1;
+        });
+
         // Failed chapter count from chapters list
         const failedChapterCount = computed(() => {
             return chapters.value.filter(ch => ch.status === 'failed' || ch.error_message).length;
@@ -226,6 +241,31 @@ const app = createApp({
         const globalRunningTask = computed(() => {
             const tasks = queueTasks.value || [];
             return tasks.find(task => task.status === 'running' || task.status === 'pausing') || null;
+        });
+
+        const liveTaskStatuses = ['running', 'pausing', 'queued', 'paused'];
+        const taskStatusRank = {
+            running: 0,
+            pausing: 0,
+            queued: 1,
+            paused: 2,
+        };
+
+        const sortedQueueTasks = computed(() => {
+            return [...(queueTasks.value || [])].sort((a, b) => {
+                const rankA = taskStatusRank[a.status] ?? 3;
+                const rankB = taskStatusRank[b.status] ?? 3;
+                if (rankA !== rankB) return rankA - rankB;
+                if (rankA === 1) {
+                    const priorityDiff = (b.queue_priority || 0) - (a.queue_priority || 0);
+                    if (priorityDiff) return priorityDiff;
+                }
+                return new Date(b.updated_at || b.created_at || 0) - new Date(a.updated_at || a.created_at || 0);
+            });
+        });
+
+        const canClearTaskHistory = computed(() => {
+            return (queueTasks.value || []).some(task => !liveTaskStatuses.includes(task.status));
         });
 
         const hasOtherNovelRunning = computed(() => {
@@ -426,6 +466,26 @@ const app = createApp({
             }
         }
 
+        async function clearTaskHistory() {
+            if (!canClearTaskHistory.value) return;
+            if (!confirm('清空已完成、失败、取消和中断的历史任务？正在运行、排队和暂停的任务会保留。')) return;
+            try {
+                const res = await fetch(apiUrl('/api/tasks/history'), {
+                    method: 'DELETE',
+                    headers: apiHeaders(),
+                });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const data = await res.json();
+                await loadQueueTasks();
+                if (currentNovel.value) {
+                    await loadTaskHistory(currentNovel.value.id);
+                }
+                addNotification(`已清空 ${data.deleted || 0} 条历史任务`, 'success');
+            } catch (err) {
+                addNotification('清空任务失败: ' + err.message, 'error');
+            }
+        }
+
         function syncCurrentNovelTaskFromQueue() {
             if (!currentNovel.value) return;
             const task = (queueTasks.value || []).find(
@@ -559,7 +619,9 @@ const app = createApp({
 
         async function selectChapter(chapter) {
             if (currentChapter.value && currentChapter.value.id === chapter.id) {
-                if (isMobileLayout.value) showReadingPanel();
+                if (isMobileLayout.value || window.innerWidth <= 768) showReadingPanel();
+                await nextTick();
+                scrollReadingToTop();
                 return;
             }
 
@@ -579,6 +641,7 @@ const app = createApp({
             manualEditText.value = '';
             chapterRewritePromptVisible.value = false;
             chapterRewriteInstruction.value = '';
+            showChapterTools.value = false;
 
             const url = apiUrl(`/api/novels/${currentNovel.value.id}/chapters/${chapter.id}`);
             console.log('[selectChapter] Fetching:', url);
@@ -597,9 +660,11 @@ const app = createApp({
                 if (data.expanded_content && viewMode.value === 'original') {
                     viewMode.value = 'expanded';
                 }
-                if (isMobileLayout.value) {
+                if (isMobileLayout.value || window.innerWidth <= 768) {
                     showReadingPanel();
                 }
+                await nextTick();
+                scrollReadingToTop();
             } catch (err) {
                 console.error('Failed to load chapter:', err);
                 addNotification('加载章节内容失败: ' + err.message, 'error');
@@ -628,16 +693,27 @@ const app = createApp({
         function showReadingPanel() {
             leftCollapsed.value = true;
             rightCollapsed.value = true;
+            mobileNavCollapsed.value = true;
         }
 
         function showCatalogPanel() {
             leftCollapsed.value = false;
             rightCollapsed.value = true;
+            mobileNavCollapsed.value = true;
+        }
+
+        function openCatalogFromReader() {
+            if (isMobileLayout.value) {
+                showCatalogPanel();
+            } else {
+                leftCollapsed.value = false;
+            }
         }
 
         function showTaskPanel() {
             leftCollapsed.value = true;
             rightCollapsed.value = false;
+            mobileNavCollapsed.value = true;
         }
 
         async function deleteNovel(novel) {
@@ -791,8 +867,6 @@ const app = createApp({
                 const body = {
                     chapter_ids: selectedChapterIds.value,
                     model: selectedModel.value,
-                    mode: expandMode.value,
-                    quality: expandQuality.value,
                 };
                 const res = await fetch(
                     apiUrl(`/api/novels/${currentNovel.value.id}/expand`),
@@ -859,8 +933,6 @@ const app = createApp({
                 const body = {
                     chapter_ids: [chapterId],
                     model: selectedModel.value,
-                    mode: expandMode.value,
-                    quality: expandQuality.value,
                     use_expanded_as_base: useExpandedBase,
                 };
                 const res = await fetch(
@@ -1275,6 +1347,8 @@ const app = createApp({
                 if (!res.ok) return;
                 const data = await res.json();
                 currentChapter.value = data;
+                await nextTick();
+                scrollReadingToTop();
             } catch (err) {
                 console.error('Failed to refresh chapter:', err);
             }
@@ -1562,6 +1636,61 @@ const app = createApp({
             manualEditText.value = '';
         }
 
+        function openChapterEditor(target) {
+            if (!currentChapter.value) return;
+            chapterEditorTarget.value = target === 'original' ? 'original' : 'expanded';
+            if (chapterEditorTarget.value === 'original') {
+                chapterEditorText.value = currentChapter.value.original_content || '';
+            } else {
+                chapterEditorText.value = currentChapter.value.expanded_content || currentChapter.value.original_content || '';
+            }
+            chapterEditorVisible.value = true;
+            nextTick(() => {
+                const el = document.querySelector('.chapter-edit-textarea');
+                if (el) el.focus();
+            });
+        }
+
+        function closeChapterEditor() {
+            if (chapterEditorSaving.value) return;
+            chapterEditorVisible.value = false;
+            chapterEditorText.value = '';
+        }
+
+        async function saveChapterEditor() {
+            if (!currentNovel.value || !currentChapter.value) return;
+            const content = chapterEditorText.value || '';
+            if (!content.trim()) {
+                addNotification('章节内容不能为空', 'warning');
+                return;
+            }
+            chapterEditorSaving.value = true;
+            const isExpanded = chapterEditorTarget.value !== 'original';
+            try {
+                const res = await fetch(
+                    apiUrl(`/api/novels/${currentNovel.value.id}/chapters/${currentChapter.value.id}/save-content`),
+                    {
+                        method: 'POST',
+                        headers: apiHeaders({ 'Content-Type': 'application/json' }),
+                        body: JSON.stringify({ content, is_expanded: isExpanded }),
+                    }
+                );
+                if (!res.ok) {
+                    const errData = await res.json().catch(() => ({}));
+                    throw new Error(errData.detail || errData.error || `HTTP ${res.status}`);
+                }
+                addNotification(isExpanded ? '扩写内容已保存' : '原文已保存', 'success');
+                chapterEditorVisible.value = false;
+                await refreshCurrentChapter();
+                await refreshNovelDetail(currentNovel.value.id);
+                viewMode.value = isExpanded ? 'expanded' : 'original';
+            } catch (err) {
+                addNotification('保存失败: ' + err.message, 'error');
+            } finally {
+                chapterEditorSaving.value = false;
+            }
+        }
+
         async function saveManualEdit() {
             if (manualEditIndex.value === null || !currentNovel.value || !currentChapter.value) return;
             const idx = manualEditIndex.value;
@@ -1704,12 +1833,6 @@ const app = createApp({
                     if (parsed.apiBase !== settings.apiBase) {
                         localStorage.setItem('novel-expander-settings', JSON.stringify({ ...settings }));
                     }
-                    if (parsed.expandMode === 'one_pass' || parsed.expandMode === 'detailed') {
-                        expandMode.value = parsed.expandMode;
-                    }
-                    if (['balanced', 'nuanced', 'unleashed'].includes(parsed.expandQuality)) {
-                        expandQuality.value = parsed.expandQuality;
-                    }
                     selectedModel.value = settings.defaultModel || 'grok-4.20-auto';
                     if (parsed.selectedModel) {
                         selectedModel.value = parsed.selectedModel;
@@ -1721,8 +1844,6 @@ const app = createApp({
         }
 
         function saveExpansionSettings(closeModal = false) {
-            settings.expandMode = expandMode.value;
-            settings.expandQuality = expandQuality.value;
             settings.selectedModel = selectedModel.value;
             settings.defaultModel = selectedModel.value || settings.defaultModel || 'grok-4.20-auto';
             localStorage.setItem('novel-expander-settings', JSON.stringify({ ...settings }));
@@ -1996,6 +2117,19 @@ const app = createApp({
             rightChapterScrollTop.value = event.target.scrollTop;
         }
 
+        function scrollReadingToTop() {
+            const el = contentBodyRef.value || document.querySelector('.content-body');
+            if (el && typeof el.scrollTo === 'function') {
+                el.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+            } else if (el) {
+                el.scrollTop = 0;
+            }
+            const compareColumns = document.querySelectorAll('.compare-column .reading-area');
+            compareColumns.forEach(column => {
+                if ('scrollTop' in column) column.scrollTop = 0;
+            });
+        }
+
         function selectRelativeChapter(offset) {
             if (!chapters.value.length) return;
             const currentIndex = currentChapter.value
@@ -2180,7 +2314,7 @@ const app = createApp({
             window.addEventListener('resize', syncMobileLayout);
         });
 
-        watch([expandMode, expandQuality, selectedModel], () => {
+        watch([selectedModel], () => {
             saveExpansionSettings(false);
         });
 
@@ -2204,8 +2338,6 @@ const app = createApp({
             chapters,
             taskHistory,
             viewMode,
-            expandMode,
-            expandQuality,
             selectedModel,
             selectedChapterIds,
             chapterRangeInput,
@@ -2226,6 +2358,10 @@ const app = createApp({
             chapterRewritePromptVisible,
             chapterRewriteInstruction,
             isChapterRewriting,
+            chapterEditorVisible,
+            chapterEditorTarget,
+            chapterEditorText,
+            chapterEditorSaving,
             showUploadModal,
             showSettingsModal,
             showExportModal,
@@ -2237,6 +2373,7 @@ const app = createApp({
             leftCollapsed,
             rightCollapsed,
             isMobileLayout,
+            mobileNavCollapsed,
             exportFormat,
             exportSeparatorStyle,
             notifications,
@@ -2261,8 +2398,12 @@ const app = createApp({
             manualEditText,
             sseReconnecting,
             queueTasks,
+            showChapterTools,
+            contentBodyRef,
 
             // Computed
+            sortedQueueTasks,
+            canClearTaskHistory,
             displayParagraphs,
             visibleChapters,
             visibleSelectableChapters,
@@ -2277,6 +2418,9 @@ const app = createApp({
             estimatedRemaining,
             progressPercent,
             canUndo,
+            currentChapterIndex,
+            hasPreviousChapter,
+            hasNextChapter,
             failedChapterCount,
             latestFailedTask,
             showFailedTaskAlert,
@@ -2287,6 +2431,8 @@ const app = createApp({
             loadNovels,
             selectNovel,
             selectChapter,
+            selectRelativeChapter,
+            openCatalogFromReader,
             closeMobilePanels,
             showReadingPanel,
             showCatalogPanel,
@@ -2310,6 +2456,7 @@ const app = createApp({
             dismissFailedAlert,
             loadTaskHistory,
             loadQueueTasks,
+            clearTaskHistory,
             syncCurrentNovelTaskFromQueue,
             showChapterRewriteInstruction,
             submitChapterRewriteInstruction,
@@ -2318,6 +2465,9 @@ const app = createApp({
             startEditParagraph,
             cancelManualEdit,
             saveManualEdit,
+            openChapterEditor,
+            closeChapterEditor,
+            saveChapterEditor,
             toggleAllChapters,
             toggleChapter,
             isChapterSelected,

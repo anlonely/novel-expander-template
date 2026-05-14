@@ -28,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse, Response, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from sqlalchemy import select, func, update
+from sqlalchemy import case, delete, select, func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sse_starlette.sse import EventSourceResponse
@@ -39,14 +39,16 @@ from database import init_db, migrate_db, get_db, async_session
 from models import Novel, Chapter, ExpandTask
 from parser import parse_novel_from_bytes
 from ai_service import (
+    AIRefusalError,
+    ExpansionIntegrityError,
     expand_chapter_one_pass,
-    expand_chapter_detailed,
     chat_completion,
     stream_rewrite_paragraph,
     split_into_paragraphs,
     merge_paragraphs,
     generate_chapter_summary,
     build_local_chapter_summary,
+    normalize_output_text,
     get_prompt_settings,
     update_prompt_settings,
     reset_prompt_settings,
@@ -225,12 +227,57 @@ def _is_fatal_api_error(error: Exception) -> bool:
     return any(marker in text for marker in fatal_markers)
 
 
+# AI 在"无需扩写"时可能输出的通知短语（当系统角色配置为"还原器"时）
+_NO_EXPANSION_NOTICE_SIGNALS = [
+    "未检测到明确的省略",
+    "未检测到需要扩写",
+    "已按原文保留",
+    "本章未检测到",
+    "没有检测到删减",
+    "无需扩写",
+    "不需要扩写",
+    "原文保留",
+    "拒绝生成该内容",
+    "拒绝处理此请求",
+    "xAI核心安全准则",
+    "我无法生成、扩展",
+    "我无法生成、扩展、还原",
+    "请提供明确以双方",
+    "请提供**明确以成年",
+    "此请求通过自定义",
+    "属于典型的越狱",
+]
+
+
+def _is_no_expansion_notice(expanded: str, input_content: str) -> bool:
+    """判断 AI 返回值是否属于"无需扩写"通知，而非真正的扩写结果。
+
+    触发条件（任意满足）：
+    1. 返回值与输入原文完全相同
+    2. 返回值 <= 500字 且含已知通知短语
+    3. 返回值不足原文的 30% 且含已知通知短语
+    """
+    if expanded == input_content:
+        return True
+    if not expanded:
+        return True
+    if len(expanded) <= 500:
+        for signal in _NO_EXPANSION_NOTICE_SIGNALS:
+            if signal in expanded:
+                return True
+    if len(expanded) < len(input_content) * 0.3:
+        for signal in _NO_EXPANSION_NOTICE_SIGNALS:
+            if signal in expanded:
+                return True
+    return False
+
+
 # ========== Pydantic 请求模型 ==========
 class ExpandRequest(BaseModel):
     chapter_ids: Optional[List[int]] = None
     model: Optional[str] = None
-    mode: str = "one_pass"  # one_pass or detailed
-    quality: str = "balanced"  # balanced, nuanced, unleashed
+    mode: str = "one_pass"  # legacy clients may send old values; server normalizes to one_pass
+    quality: str = "balanced"  # legacy clients may send old values; server normalizes to balanced
     use_expanded_as_base: bool = False  # True = 基于已扩写内容再次扩写
 
 
@@ -273,7 +320,7 @@ def _sanitize_filename(name: str) -> str:
 
 
 def _chapter_display_content(chapter: Chapter) -> str:
-    return chapter.expanded_content if chapter.expanded_content else chapter.original_content
+    return normalize_output_text(chapter.expanded_content if chapter.expanded_content else chapter.original_content)
 
 
 def _chapter_weight(chapter: Chapter) -> int:
@@ -304,9 +351,10 @@ async def _refresh_novel_global_summary(novel_id: int):
         if not novel:
             return
 
-        chapters_with_summary = [
-            ch for ch in novel.chapters if ch.summary
-        ]
+        chapters_with_summary = sorted(
+            (ch for ch in novel.chapters if ch.summary),
+            key=lambda ch: ch.sort_order,
+        )
 
         if not chapters_with_summary:
             novel.global_summary = None
@@ -1121,21 +1169,25 @@ async def get_chapter(novel_id: int, chapter_id: int, db: AsyncSession = Depends
 
     # 分段
     paragraphs = []
-    if chapter.original_content:
-        paras = split_into_paragraphs(chapter.original_content)
+    original_content = normalize_output_text(chapter.original_content)
+    expanded_content = normalize_output_text(chapter.expanded_content)
+    expanded_content_prev = normalize_output_text(chapter.expanded_content_prev)
+
+    if original_content:
+        paras = split_into_paragraphs(original_content)
         paragraphs = [{"index": i, "text": p} for i, p in enumerate(paras)]
 
     expanded_paragraphs = None
-    if chapter.expanded_content:
-        exp_paras = split_into_paragraphs(chapter.expanded_content)
+    if expanded_content:
+        exp_paras = split_into_paragraphs(expanded_content)
         expanded_paragraphs = [{"index": i, "text": p} for i, p in enumerate(exp_paras)]
 
     return {
         "id": chapter.id,
         "title": chapter.title,
-        "original_content": chapter.original_content,
-        "expanded_content": chapter.expanded_content,
-        "expanded_content_prev": chapter.expanded_content_prev,  # 新增
+        "original_content": original_content,
+        "expanded_content": expanded_content,
+        "expanded_content_prev": expanded_content_prev,  # 新增
         "status": chapter.status,
         "skipped": chapter.skipped,  # 新增
         "error_message": chapter.error_message,  # 新增
@@ -1180,8 +1232,8 @@ async def start_expand(novel_id: int, body: ExpandRequest, db: AsyncSession = De
         novel_id=novel_id,
         status="queued",
         model=body.model or config.DEFAULT_MODEL,
-        mode=body.mode,
-        quality=body.quality or "balanced",
+        mode="one_pass",
+        quality="balanced",
         total_chapters=total,
         chapter_ids_json=chapter_ids_json,
         use_expanded_as_base=body.use_expanded_as_base,
@@ -1348,8 +1400,8 @@ async def retry_failed_chapters(novel_id: int, db: AsyncSession = Depends(get_db
         novel_id=novel_id,
         status="queued",
         model=old_task.model,
-        mode=old_task.mode,
-        quality=old_task.quality or "balanced",
+        mode="one_pass",
+        quality="balanced",
         total_chapters=len(failed_ids),
         chapter_ids_json=json.dumps(failed_ids),
         use_expanded_as_base=old_task.use_expanded_as_base,
@@ -1400,7 +1452,7 @@ async def save_chapter_content(
     if not chapter:
         raise HTTPException(status_code=404, detail="Chapter not found")
 
-    content = (body.content or "").strip()
+    content = normalize_output_text((body.content or "").strip())
     if not content:
         raise HTTPException(status_code=400, detail="Content cannot be empty")
 
@@ -1415,12 +1467,13 @@ async def save_chapter_content(
         if chapter.status == "failed":
             chapter.status = "pending"
 
+    summary_source = content if body.is_expanded else (chapter.expanded_content or content)
+    chapter.summary = build_local_chapter_summary(chapter.title, summary_source)
     chapter.error_message = None
     chapter.progress = 1.0
     chapter.updated_at = datetime.utcnow()
     await db.commit()
-    if body.is_expanded:
-        await _refresh_novel_global_summary(novel_id)
+    await _refresh_novel_global_summary(novel_id)
 
     return {"message": "Content saved", "chapter_id": chapter_id, "is_expanded": body.is_expanded}
 
@@ -1482,10 +1535,22 @@ async def check_interrupted(novel_id: int, db: AsyncSession = Depends(get_db)):
 @app.get("/api/novels/{novel_id}/tasks")
 async def get_task_history(novel_id: int, limit: int = 20, db: AsyncSession = Depends(get_db)):
     limit = max(1, min(limit, 100))
+    status_rank = case(
+        (ExpandTask.status.in_(["running", "pausing"]), 0),
+        (ExpandTask.status == "queued", 1),
+        (ExpandTask.status == "paused", 2),
+        else_=3,
+    )
     stmt = (
         select(ExpandTask)
         .where(ExpandTask.novel_id == novel_id)
-        .order_by(ExpandTask.created_at.desc())
+        .order_by(
+            status_rank,
+            ExpandTask.queue_priority.desc(),
+            ExpandTask.updated_at.desc(),
+            ExpandTask.created_at.desc(),
+            ExpandTask.id.desc(),
+        )
         .limit(limit)
     )
     result = await db.execute(stmt)
@@ -1496,9 +1561,21 @@ async def get_task_history(novel_id: int, limit: int = 20, db: AsyncSession = De
 @app.get("/api/tasks/queue")
 async def list_global_queue(limit: int = 80, db: AsyncSession = Depends(get_db)):
     limit = max(1, min(limit, 200))
+    status_rank = case(
+        (ExpandTask.status.in_(["running", "pausing"]), 0),
+        (ExpandTask.status == "queued", 1),
+        (ExpandTask.status == "paused", 2),
+        else_=3,
+    )
     stmt = (
         select(ExpandTask)
-        .order_by(ExpandTask.updated_at.desc(), ExpandTask.created_at.desc(), ExpandTask.id.desc())
+        .order_by(
+            status_rank,
+            ExpandTask.queue_priority.desc(),
+            ExpandTask.updated_at.desc(),
+            ExpandTask.created_at.desc(),
+            ExpandTask.id.desc(),
+        )
         .limit(limit)
     )
     result = await db.execute(stmt)
@@ -1514,6 +1591,19 @@ async def list_global_queue(limit: int = 80, db: AsyncSession = Depends(get_db))
         item["novel_title"] = titles.get(task.novel_id, f"Novel {task.novel_id}")
         items.append(item)
     return {"tasks": items}
+
+
+@app.delete("/api/tasks/history")
+async def clear_task_history(db: AsyncSession = Depends(get_db)):
+    """清空历史任务，保留正在运行、排队和暂停相关任务。"""
+    protected_statuses = ["queued", "running", "pausing", "paused"]
+    protected_ids = set(active_tasks.keys())
+    stmt = delete(ExpandTask).where(~ExpandTask.status.in_(protected_statuses))
+    if protected_ids:
+        stmt = stmt.where(~ExpandTask.id.in_(protected_ids))
+    result = await db.execute(stmt)
+    await db.commit()
+    return {"deleted": result.rowcount or 0}
 
 
 @app.post("/api/tasks/{task_id}/prioritize")
@@ -1624,11 +1714,23 @@ async def rewrite_chapter_endpoint(
             }
 
         # 保存结果
+        full_text = normalize_output_text(full_text)
         async with async_session() as save_db:
             save_stmt = select(Chapter).where(Chapter.id == chapter_id)
             save_result = await save_db.execute(save_stmt)
             save_chapter = save_result.scalar_one_or_none()
             if save_chapter:
+                if _is_no_expansion_notice(full_text, content):
+                    save_chapter.status = "skipped"
+                    save_chapter.skipped = True
+                    save_chapter.error_message = None
+                    save_chapter.updated_at = datetime.utcnow()
+                    await save_db.commit()
+                    yield {
+                        "event": "done",
+                        "data": json.dumps({"chapter_id": chapter_id, "status": "skipped"}, ensure_ascii=False),
+                    }
+                    return
                 if save_chapter.expanded_content != full_text:
                     save_chapter.expanded_content_prev = save_chapter.expanded_content
                 save_chapter.expanded_content = full_text
@@ -1755,15 +1857,10 @@ async def expand_worker(task_id: int, cancel_event: asyncio.Event, resume_from_i
 
             novel_id = task.novel_id
             model = task.model
-            mode = task.mode
-            quality = task.quality or "balanced"
+            mode = "one_pass"
+            quality = "balanced"
             use_expanded_base = task.use_expanded_as_base or False
             novel_global_summary = ""
-
-            if config.CONSERVE_REQUESTS and mode == "detailed":
-                logger.info("Conserve mode enabled: detailed mode downgraded to one_pass")
-                mode = "one_pass"
-                task.mode = "one_pass"
 
             novel_stmt = select(Novel).where(Novel.id == novel_id)
             novel_result = await db.execute(novel_stmt)
@@ -1983,7 +2080,7 @@ async def expand_worker(task_id: int, cancel_event: asyncio.Event, resume_from_i
                         input_content = chapter.expanded_content
                         logger.info(f"继续扩写模式：基于已扩写内容 ({len(chapter.expanded_content)}字)")
 
-                    # 获取下一章开头作为衔接上下文
+                    # 获取下一章短锚点作为衔接上下文。只给很短片段，避免模型把下一章正文复制到本章结尾。
                     next_chapter_opening = ""
                     if ch_idx + 1 < total_chapters:
                         next_ch_id = chapters_data[ch_idx + 1]["id"]
@@ -1991,12 +2088,12 @@ async def expand_worker(task_id: int, cancel_event: asyncio.Event, resume_from_i
                             async with async_session() as next_db:
                                 next_ch = await next_db.get(Chapter, next_ch_id)
                                 if next_ch and next_ch.original_content:
-                                    # 取下一章开头约800字（到句子边界）
-                                    opening = next_ch.original_content[:800]
+                                    # 取下一章开头约180字（到句子边界）
+                                    opening = next_ch.original_content[:180]
                                     # 在句子边界截断
                                     for sep in ['。', '！', '？', '"', '\n']:
                                         last_pos = opening.rfind(sep)
-                                        if last_pos > 200:
+                                        if last_pos > 40:
                                             opening = opening[:last_pos + 1]
                                             break
                                     next_chapter_opening = f"【{next_ch.title}】\n{opening}"
@@ -2014,7 +2111,7 @@ async def expand_worker(task_id: int, cancel_event: asyncio.Event, resume_from_i
                         async with async_session() as save_db:
                             ch = await save_db.get(Chapter, _chapter_id)
                             if ch:
-                                ch.expanded_content = intermediate_text
+                                ch.expanded_content = normalize_output_text(intermediate_text)
                                 ch.updated_at = datetime.utcnow()
                                 await save_db.commit()
                         logger.info(f"中间保存: {seg_done}/{seg_total} 段")
@@ -2025,19 +2122,8 @@ async def expand_worker(task_id: int, cancel_event: asyncio.Event, resume_from_i
                         prev_summary=prev_summary,
                     )
 
-                    if mode == "detailed":
-                        expanded = await expand_chapter_detailed(
-                            chapter.title,
-                            input_content,
-                            context_summary,
-                            model=model,
-                            quality=quality,
-                            progress_callback=progress_callback,
-                            next_chapter_opening=next_chapter_opening,
-                            skip_if_no_content=config.SKIP_IF_NO_CONTENT,
-                            segment_save_callback=segment_save_cb,
-                        )
-                    else:
+                    ai_refused = False
+                    try:
                         expanded = await expand_chapter_one_pass(
                             chapter.title,
                             input_content,
@@ -2049,6 +2135,17 @@ async def expand_worker(task_id: int, cancel_event: asyncio.Event, resume_from_i
                             skip_if_no_content=config.SKIP_IF_NO_CONTENT,
                             segment_save_callback=segment_save_cb,
                         )
+                    except AIRefusalError as e:
+                        logger.warning(
+                            "Task %s: AI refused chapter %s, falling back to original content: %s",
+                            task_id,
+                            chapter_title,
+                            e,
+                        )
+                        ai_refused = True
+                        expanded = input_content
+
+                    expanded = normalize_output_text(expanded)
 
                     # If a cancel request arrives during the chapter call, stop before committing results.
                     if cancel_event.is_set():
@@ -2073,12 +2170,19 @@ async def expand_worker(task_id: int, cancel_event: asyncio.Event, resume_from_i
                         pause_requests.discard(task_id)
                         return
 
-                    # 判断是否被跳过（返回值等于输入内容说明无需扩写）
-                    if expanded == input_content:
+                    # 判断是否被跳过（AI 返回原文、拒绝通知或"无需扩写"通知，均视为跳过）
+                    chapter_was_skipped = ai_refused or _is_no_expansion_notice(expanded, input_content)
+                    if chapter_was_skipped:
                         chapter.status = "skipped"
                         chapter.skipped = True
                         chapter.progress = 1.0
                         chapter.error_message = None
+                        # 若 segment_save_cb 已将通知文本写入 expanded_content，清除它
+                        # 确保导出时回落到 original_content，而非通知字符串
+                        if ai_refused or (chapter.expanded_content and _is_no_expansion_notice(
+                            chapter.expanded_content, input_content
+                        )):
+                            chapter.expanded_content = None
                         chapter.updated_at = datetime.utcnow()
                         await db.commit()
                         skipped_count += 1
@@ -2115,7 +2219,7 @@ async def expand_worker(task_id: int, cancel_event: asyncio.Event, resume_from_i
                 # 广播章节完成
                 await broadcast_sse(novel_id, "chapter_done", {
                     "chapter_id": chapter_id,
-                    "status": "completed" if expanded != input_content else "skipped",
+                    "status": "skipped" if chapter_was_skipped else "completed",
                 })
 
                 # 生成并保存章节摘要（确保上下文链不断，跳过的章节也生成摘要）
@@ -2152,6 +2256,41 @@ async def expand_worker(task_id: int, cancel_event: asyncio.Event, resume_from_i
             except asyncio.CancelledError:
                 logger.info(f"Task {task_id} cancelled during chapter {chapter_title}")
                 raise
+            except ExpansionIntegrityError as e:
+                logger.error(f"Integrity check failed for chapter {chapter_title}: {e}")
+                failed_count += 1
+                failed_ids.append(chapter_id)
+
+                try:
+                    async with async_session() as db:
+                        fail_ch = await db.get(Chapter, chapter_id)
+                        if fail_ch:
+                            # 清掉分段中间保存的半成品，避免导出时混入漏剧情/串章文本。
+                            fail_ch.expanded_content = previous_expanded_snapshot
+                            fail_ch.status = "failed"
+                            fail_ch.error_message = str(e)
+                            fail_ch.updated_at = datetime.utcnow()
+                            await db.commit()
+                except Exception as db_err:
+                    logger.error(f"Failed to update integrity failure status: {db_err}")
+
+                try:
+                    async with async_session() as db:
+                        task_obj = await db.get(ExpandTask, task_id)
+                        if task_obj:
+                            task_obj.failed_chapters = failed_count
+                            task_obj.failed_chapter_ids_json = json.dumps(failed_ids)
+                            task_obj.last_completed_index = ch_idx
+                            task_obj.error_message = str(e)
+                            task_obj.updated_at = datetime.utcnow()
+                            await db.commit()
+                except Exception:
+                    pass
+
+                await broadcast_sse(novel_id, "error", {
+                    "chapter_id": chapter_id,
+                    "error": str(e),
+                })
             except Exception as e:
                 logger.error(f"Failed to expand chapter {chapter_title}: {e}", exc_info=True)
                 # 失败不计入 completed，计入 failed

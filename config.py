@@ -46,22 +46,14 @@ MODEL_MAX_TOKENS = {
     "grok-3-mini": 131072,  # 快速：适合非创作任务（分析/摘要），创作质量偏弱
 }
 DEFAULT_MAX_TOKENS = 131072
-OUTPUT_RESERVED_TOKENS = 16000  # 为输出预留的 token 数（分段模式下每段输出约 3000-8000 tokens 足够）
-SYSTEM_PROMPT_RESERVED_TOKENS = 4000  # 为系统提示词预留的 token 数（放开写模式系统提示更长）
+OUTPUT_RESERVED_TOKENS = 16000  # 为输出预留的 token 数（每段输出约 3000-8000 tokens 足够）
+SYSTEM_PROMPT_RESERVED_TOKENS = 4000  # 为系统提示词预留的 token 数
 
-# 质量感知的 one-pass 最大章节字数（超过则强制分段，防止输出过长导致质量下降）
-ONE_PASS_MAX_CHARS = {
-    "balanced": 20000,   # 稳妥模式：2万字以内一次处理
-    "nuanced": 15000,    # 细腻模式：1.5万字
-    "unleashed": 7000,   # 放开写模式：更早分段，避免单请求遗忘和短输出
-}
+# 默认综合模式的 one-pass 最大章节字数（超过则强制分段，防止输出过长导致质量下降）
+ONE_PASS_MAX_CHARS = 7000
 
-# 质量感知的分段目标大小（字符数）
-SEGMENT_SIZE_BY_QUALITY = {
-    "balanced": 8000,
-    "nuanced": 6000,
-    "unleashed": 3500,   # 放开写模式每段更小，让 AI 集中精力写好每段
-}
+# 默认综合模式的长章节分段目标大小（字符数）
+DEFAULT_SEGMENT_SIZE = 6000
 CONSERVE_REQUESTS = os.getenv("CONSERVE_REQUESTS", "true").lower() == "true"  # 单 token 省请求模式
 SKIP_IF_NO_CONTENT = os.getenv("SKIP_IF_NO_CONTENT", "true").lower() == "true"  # 未检测到省略时是否跳过扩写
 EXPANSION_CHECK_MODE = os.getenv("EXPANSION_CHECK_MODE", "romance_or_omission")  # romance_or_omission / omission_only / always

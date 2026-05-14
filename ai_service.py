@@ -49,6 +49,34 @@ _last_request_time = 0.0
 _consecutive_429_count = 0
 
 
+class AIRefusalError(Exception):
+    """Raised when the upstream model returns a refusal notice instead of content."""
+
+
+class ExpansionIntegrityError(Exception):
+    """Raised when generated text drops source plot anchors or leaks context text."""
+
+
+_TEXT_NORMALIZATION_PATTERNS = [
+    (re.compile(r"马\s*叉\s*虫"), "骚"),
+    (re.compile(r"馬\s*叉\s*虫"), "骚"),
+    (re.compile(r"马\s*蚤"), "骚"),
+    (re.compile(r"馬\s*蚤"), "骚"),
+    (re.compile(r"马\s*叉"), "骚"),
+    (re.compile(r"馬\s*叉"), "骚"),
+]
+
+
+def normalize_output_text(text: str) -> str:
+    """Normalize common split-character euphemisms before saving or displaying text."""
+    if not text:
+        return text
+    normalized = text
+    for pattern, replacement in _TEXT_NORMALIZATION_PATTERNS:
+        normalized = pattern.sub(replacement, normalized)
+    return normalized
+
+
 # ========== 请求基础设施 ==========
 
 async def _rate_limit_wait():
@@ -182,6 +210,19 @@ async def chat_completion(
                     )
                     result = response.choices[0].message.content
 
+                if not isinstance(result, str) or not result.strip():
+                    last_error = RuntimeError(f"模型返回空内容: model={current_model}")
+                    logger.warning(
+                        "模型返回空内容 model=%s (attempt %s/%s)",
+                        current_model,
+                        attempt + 1,
+                        config.MAX_RETRIES,
+                    )
+                    if attempt < config.MAX_RETRIES - 1 or len(model_candidates) > 1:
+                        await asyncio.sleep(2)
+                        continue
+                    raise last_error
+
                 # 检测文本拒绝
                 refusal = _detect_refusal(result)
                 if refusal:
@@ -191,7 +232,7 @@ async def chat_completion(
                         temperature = min(temperature + 0.1, 1.0)
                         await asyncio.sleep(3)
                         continue
-                    raise Exception(f"AI拒绝处理此内容，已重试{config.MAX_RETRIES}次")
+                    raise AIRefusalError(f"AI拒绝处理此内容，已重试{config.MAX_RETRIES}次")
 
                 # 成功 — 重置全局退避计数
                 _reset_backoff()
@@ -255,6 +296,12 @@ _REFUSAL_PATTERNS = [
     "无法按照您的要求",
     "超出了我当前的响应边界",
     "无法生成此类",
+    "拒绝处理此请求",
+    "xAI核心安全准则",
+    "我无法生成、扩展",
+    "我无法生成、扩展、还原",
+    "请提供明确以双方",
+    "请提供**明确以成年",
     "I cannot",
     "I'm unable to",
     "I can't assist",
@@ -265,6 +312,24 @@ _REFUSAL_PATTERNS = [
     "不适合生成",
     "As an AI",
     "As Grok",
+    # 补充：AI 自我声明式拒绝（Claude / Gemini / 国产模型常见格式）
+    "拒绝生成该内容",
+    "此请求通过自定义",
+    "越狱/角色扮演绕过",
+    "属于典型的越狱",
+    "我不会按该自定义规则",
+    "不会按该自定义规则",
+    "不会输出任何修改",
+    "应原样保留",          # 避免将"保留原文"说明误存为内容
+    "我无法协助",
+    "我不能协助",
+    "无法协助完成",
+    "这超出了我的",
+    "这违反了我的",
+    "该请求违反",
+    "Sorry, I can",
+    "I apologize, but I",
+    "Unfortunately, I",
 ]
 
 _OMISSION_PATTERNS = [
@@ -309,6 +374,149 @@ def _detect_refusal(text: str) -> Optional[str]:
     return None
 
 
+def _compact_match_text(text: str) -> str:
+    """Normalize text for anchor checks without losing Chinese character order."""
+    text = normalize_output_text(text or "")
+    return re.sub(r"[\s\u3000\"'“”‘’《》【】\[\]（）()，,。.!！?？:：;；、…—\-]+", "", text)
+
+
+def _anchor_windows(text: str, size: int = 28) -> List[str]:
+    compact = _compact_match_text(text)
+    if len(compact) < size:
+        return [compact] if len(compact) >= 14 else []
+    if len(compact) <= size * 2:
+        return [compact[:size]]
+    return [compact[:size], compact[-size:]]
+
+
+def _paragraph_has_expansion_marker(paragraph: str) -> bool:
+    return any(pattern.search(paragraph) for pattern in _OMISSION_PATTERNS)
+
+
+def _source_coverage_issues(source_text: str, output_text: str) -> List[str]:
+    """Detect severe source loss while allowing local expansion/rephrasing."""
+    issues: List[str] = []
+    source_norm = _compact_match_text(source_text)
+    output_norm = _compact_match_text(output_text)
+    if not source_norm or not output_norm:
+        return ["输出为空，无法保存"]
+    if output_norm == source_norm:
+        return []
+    if len(source_norm) >= 1200 and len(output_norm) < len(source_norm) * 0.55:
+        issues.append(f"输出长度过短：{len(output_norm)}/{len(source_norm)}")
+
+    paragraphs = [
+        p for p in split_into_paragraphs(source_text)
+        if len(_compact_match_text(p)) >= 36 and not _paragraph_has_expansion_marker(p)
+    ]
+    if not paragraphs:
+        return issues
+
+    # 首尾剧情锚点最容易暴露“只续写一段”或“漏掉结尾”的问题。
+    head_anchors = _anchor_windows(paragraphs[0])
+    tail_anchors = _anchor_windows(paragraphs[-1])
+    if head_anchors and not any(anchor in output_norm for anchor in head_anchors):
+        issues.append("章节开头剧情锚点缺失")
+    if tail_anchors and not any(anchor in output_norm for anchor in tail_anchors):
+        issues.append("章节结尾剧情锚点缺失")
+
+    if len(paragraphs) <= 14:
+        sample = paragraphs
+    else:
+        step = max(1, len(paragraphs) // 12)
+        sample = paragraphs[::step][:12]
+        if paragraphs[-1] not in sample:
+            sample.append(paragraphs[-1])
+
+    missing = 0
+    checked = 0
+    for paragraph in sample:
+        anchors = _anchor_windows(paragraph)
+        if not anchors:
+            continue
+        checked += 1
+        if not any(anchor in output_norm for anchor in anchors):
+            missing += 1
+    if checked >= 6 and missing / checked >= 0.7:
+        issues.append(f"原文剧情锚点大量缺失：{missing}/{checked}")
+    return issues
+
+
+def _strip_forbidden_context_leak(output_text: str, forbidden_context: str) -> Tuple[str, bool]:
+    """Trim copied next-chapter/context text if it appears near the generated ending."""
+    if not output_text or not forbidden_context:
+        return output_text, False
+
+    candidates: List[str] = []
+    for line in forbidden_context.splitlines():
+        cleaned = line.strip()
+        if len(cleaned) >= 18 or (cleaned.startswith("【") and cleaned.endswith("】") and len(cleaned) >= 4):
+            candidates.append(cleaned)
+    for sentence in re.split(r"(?<=[。！？!?…])", forbidden_context):
+        cleaned = sentence.strip()
+        if 10 <= len(cleaned) <= 220:
+            candidates.append(cleaned)
+
+    # Prefer longer snippets so ordinary shared names/titles do not trigger trimming.
+    candidates = sorted(set(candidates), key=len, reverse=True)
+    start_limit = int(len(output_text) * 0.45)
+    for candidate in candidates:
+        pos = output_text.find(candidate)
+        if pos >= start_limit:
+            return output_text[:pos].rstrip(), True
+    return output_text, False
+
+
+def _integrity_failure_message(source_text: str, output_text: str, forbidden_context: str = "") -> str:
+    cleaned, leaked = _strip_forbidden_context_leak(output_text, forbidden_context)
+    issues = _source_coverage_issues(source_text, cleaned)
+    if leaked:
+        issues.append("输出结尾复制了下一章/上下文参考内容")
+    return "；".join(issues)
+
+
+async def _retry_with_integrity_guard(
+    *,
+    messages: List[Dict[str, str]],
+    source_text: str,
+    output_text: str,
+    model: str,
+    temperature: float,
+    forbidden_context: str = "",
+    max_tokens: Optional[int] = None,
+) -> str:
+    cleaned, leaked = _strip_forbidden_context_leak(output_text, forbidden_context)
+    issues = _source_coverage_issues(source_text, cleaned)
+    if not leaked and not issues:
+        return cleaned
+
+    issue_text = "；".join((["输出结尾复制了参考上下文"] if leaked else []) + issues)
+    logger.warning("扩写完整性校验失败，准备重试: %s", issue_text)
+    retry_messages = list(messages) + [{
+        "role": "user",
+        "content": (
+            "上一次输出不能保存，原因："
+            f"{issue_text}。\n"
+            "请重新输出完整正文：必须覆盖当前章节原文的开头、正文推进和结尾；"
+            "参考上下文和下一章开头只用于理解，绝对不要复制进正文；"
+            "不要只续写局部片段，不要丢掉非亲密剧情、对话、结果和章节收束。"
+        ),
+    }]
+    retry_result = await chat_completion(
+        retry_messages,
+        model=model,
+        temperature=max(0.25, temperature - 0.08),
+        max_tokens=max_tokens,
+    )
+    retry_result = normalize_output_text(retry_result or "")
+    cleaned, leaked = _strip_forbidden_context_leak(retry_result, forbidden_context)
+    issues = _source_coverage_issues(source_text, cleaned)
+    if leaked or issues:
+        final_issue = "；".join((["输出结尾复制了参考上下文"] if leaked else []) + issues)
+        raise ExpansionIntegrityError(f"扩写完整性校验失败：{final_issue}")
+    return cleaned
+
+
 def _heuristic_implicit_sections(paragraphs: List[str]) -> List[Dict[str, Any]]:
     """保守启发式检测明显省略段，避免分析失败时整章乱扩写。"""
     sections = []
@@ -328,6 +536,51 @@ def _heuristic_implicit_sections(paragraphs: List[str]) -> List[Dict[str, Any]]:
                 "intensity": "明显",
             })
     return sections
+
+
+def _normalize_analysis_sections(
+    sections: List[Dict[str, Any]],
+    paragraph_count: int,
+) -> List[Dict[str, Any]]:
+    """Sort, clamp and merge analysis sections so replacement cannot skip text."""
+    normalized: List[Dict[str, Any]] = []
+    for raw in sections or []:
+        if not isinstance(raw, dict) or paragraph_count <= 0:
+            continue
+        try:
+            start = int(raw.get("start_para", 0))
+            end = int(raw.get("end_para", start))
+        except (TypeError, ValueError):
+            continue
+        start = max(0, min(start, paragraph_count - 1))
+        end = max(start, min(end, paragraph_count - 1))
+        item = dict(raw)
+        item["start_para"] = start
+        item["end_para"] = end
+        normalized.append(item)
+
+    normalized.sort(key=lambda item: (item["start_para"], item["end_para"]))
+    merged: List[Dict[str, Any]] = []
+    for item in normalized:
+        if not merged or item["start_para"] > merged[-1]["end_para"] + 1:
+            merged.append(item)
+            continue
+        prev = merged[-1]
+        prev["end_para"] = max(prev["end_para"], item["end_para"])
+        descriptions = [prev.get("description", ""), item.get("description", "")]
+        prev["description"] = "；".join(part for part in descriptions if part)
+        for key in ("characters_involved", "characters"):
+            values = []
+            for candidate in (prev.get(key), item.get(key)):
+                if isinstance(candidate, list):
+                    values.extend(str(v) for v in candidate if v)
+            if values:
+                prev[key] = list(dict.fromkeys(values))
+        if item.get("metaphor_mapping") and item.get("metaphor_mapping") not in str(prev.get("metaphor_mapping", "")):
+            prev["metaphor_mapping"] = "；".join(
+                part for part in [str(prev.get("metaphor_mapping", "")), str(item.get("metaphor_mapping", ""))] if part
+            )
+    return merged
 
 
 async def _stream_completion_collect(
@@ -538,26 +791,19 @@ def _estimate_dialogue_ratio(text: str) -> float:
 
 
 def _normalize_quality(quality: Optional[str]) -> str:
-    raw = (quality or "").strip()
-    lowered = raw.lower()
-    mapping = {
-        "稳妥": "balanced",
-        "平衡": "balanced",
-        "balanced": "balanced",
-        "细腻": "nuanced",
-        "nuanced": "nuanced",
-        "放开写": "unleashed",
-        "大胆": "unleashed",
-        "unleashed": "unleashed",
-    }
-    if not raw:
-        return "balanced"
-    return mapping.get(raw, mapping.get(lowered, "balanced"))
+    # Legacy clients may still send old quality names. The product now exposes
+    # one integrated default, so all old values collapse to the same behavior.
+    return "balanced"
 
 
-def _quality_instruction(quality: str) -> str:
-    quality = _normalize_quality(quality)
-    return _prompt_value(f"quality_{quality}")
+def _strategy_instruction(quality: str = "balanced") -> str:
+    return (
+        "当前扩写策略：默认综合模式。\n"
+        "优先忠实保留原文章节骨架、对话、事件顺序和结尾结果；"
+        "只补足明确省略、隐喻替代或明显写薄的关键过程。"
+        "长章节会按场景分段处理，每段必须覆盖当前分段原文的开头、推进和结尾，"
+        "不能只写一小段就提前收束，也不能复制上下文或下一章内容。"
+    )
 
 
 _CN_NUMERAL_VALUES = {
@@ -644,6 +890,46 @@ def _continuity_tail(text: str) -> str:
     return trim_to_sentence_boundary(text, CONTINUITY_CONTEXT_CHARS, from_end=True)
 
 
+def _segment_boundary_brief(segment_text: str) -> str:
+    paragraphs = split_into_paragraphs(segment_text)
+    if not paragraphs:
+        return ""
+    first = trim_to_sentence_boundary(paragraphs[0], 180, from_end=False)
+    last = trim_to_sentence_boundary(paragraphs[-1], 220, from_end=False)
+    if first == last:
+        return f"分段首尾锚点：{first}"
+    return f"分段开头锚点：{first}\n分段结尾锚点：{last}"
+
+
+def _build_segment_context_block(
+    chapter_title: str,
+    segments: List[Dict[str, Any]],
+    segment_summaries: List[str],
+    seg_idx: int,
+) -> str:
+    current = segments[seg_idx]["text"]
+    parts = [
+        "=== 当前分段处理边界（必须遵守）===",
+        f"当前是《{chapter_title}》第 {seg_idx + 1}/{len(segments)} 段。",
+        "只扩写【当前分段原文】；上一段、下一段和下一章内容只用于衔接，严禁写入当前正文。",
+        "输出必须覆盖当前分段原文从开头到结尾的全部剧情、对话、动作和结果，不能只写一个局部场面后突然结束。",
+        _segment_boundary_brief(current),
+        "=== 当前分段摘要（只用于自检，不要输出）===",
+        segment_summaries[seg_idx],
+    ]
+    if seg_idx > 0:
+        parts.extend([
+            "=== 上一分段摘要（只用于状态衔接，不要复述）===",
+            segment_summaries[seg_idx - 1],
+        ])
+    if seg_idx + 1 < len(segments):
+        parts.extend([
+            "=== 下一分段摘要（只用于收束位置，不要提前写）===",
+            segment_summaries[seg_idx + 1],
+        ])
+    return "\n".join(part for part in parts if part)
+
+
 def _multi_process_source_context(chapter_content: str, part_index: int, required_count: int) -> str:
     """Provide the original as a compact skeleton, not as repeated material to rewrite every time."""
     if len(chapter_content) <= MULTI_PROCESS_SOURCE_CHARS:
@@ -693,7 +979,7 @@ async def _expand_multi_process_chapter(
         + "上一段结尾只用于状态衔接，不允许复述、改写或总结上一段。"
         + "禁止输出章节标题，禁止提前写后续编号，禁止用概括句跳过中间编号。"
     )
-    quality_instruction = _quality_instruction(quality)
+    strategy_instruction = _strategy_instruction(quality)
     previous_tail = ""
     generated_parts: List[str] = []
     min_total = _min_unleashed_output_chars(chapter_title, chapter_content)
@@ -745,7 +1031,7 @@ async def _expand_multi_process_chapter(
             f"{output_scope}\n"
             f"本段目标长度约 {target_min}-{target_max} 字；不得低于 {target_min} 字，除非原文信息确实不足。\n"
             "不要输出说明、标题、markdown、编号列表或分析。只输出可直接拼接进章节的正文片段。\n\n"
-            f"{quality_instruction}\n\n"
+            f"{strategy_instruction}\n\n"
             "直接输出本段正文："
         )
 
@@ -805,23 +1091,15 @@ async def _expand_multi_process_chapter(
 
 
 def _select_temperature(task: str, text: str, quality: str = "balanced") -> float:
-    """根据任务类型、文本特征和质量档位选择温度。"""
+    """根据任务类型和文本特征选择温度。"""
     dialogue_ratio = _estimate_dialogue_ratio(text)
-    quality = _normalize_quality(quality)
-    quality_bonus = {
-        "balanced": 0.0,
-        "nuanced": 0.04,
-        "unleashed": 0.12,
-    }.get(quality, 0.0)
     if task == "analysis":
         return 0.2
     if task == "summary":
         return 0.25
     if task == "rewrite":
-        return min(1.0, (0.92 if dialogue_ratio > 0.55 else 0.86) + quality_bonus)
-    if task == "detailed":
-        return min(1.0, (0.9 if dialogue_ratio > 0.55 else 0.84) + quality_bonus)
-    return min(1.0, (0.88 if dialogue_ratio > 0.55 else 0.82) + quality_bonus)
+        return 0.92 if dialogue_ratio > 0.55 else 0.86
+    return 0.88 if dialogue_ratio > 0.55 else 0.82
 
 
 IMMERSIVE_INTIMACY_STYLE_GUIDE = """
@@ -1220,24 +1498,8 @@ _ONE_PASS_SYSTEM_BASE = """你是中文小说删减内容还原器。
 
 只输出完整章节正文。"""
 
-_ONE_PASS_SYSTEM_UNLEASHED_ADDON = """
-
-【放开写模式补充】
-1. 在基础规则之上提高展开密度，让关键亲密段落形成连续场面，而不是简短补丁。
-2. 每个场面都要保留情绪推进、短暂停顿、人物反应和关系后果。
-3. 对白和心理必须服务人物关系，不能脱离原文人设。
-4. 场景变化必须来自原文铺垫，不硬切环境、不硬塞道具、不硬改人物性格。"""
-
-
 def _one_pass_system_prompt(quality: str = "balanced") -> str:
-    quality = _normalize_quality(quality)
-    base = _prompt_value("one_pass_system_base").replace(
-        "{immersive_style_guide}",
-        _prompt_value("immersive_style_guide"),
-    )
-    if quality == "unleashed":
-        return base + _prompt_value("one_pass_unleashed_addon")
-    return base
+    return _prompt_value("one_pass_system_base").replace("{immersive_style_guide}", "").strip()
 
 ONE_PASS_USER_PROMPT = """请处理以下章节：
 1. 被省略、符号替代、一笔带过、隐喻替代的段落→还原完整
@@ -1247,7 +1509,7 @@ ONE_PASS_USER_PROMPT = """请处理以下章节：
 所有写作规则以 system 提示词为准。不要输出解释、分析、标题或 markdown。
 {context_info}
 
-{quality_instruction}
+{strategy_instruction}
 
 === 当前章节：{chapter_title} ===
 {chapter_content}
@@ -1303,26 +1565,12 @@ _SECTION_EXPAND_SYSTEM_BASE = """你要只处理一个目标片段中的删减�
 
 {character_info}"""
 
-_SECTION_EXPAND_UNLEASHED_ADDON = """
-
-【放开写模式】
-篇幅目标：亲密关键片段展开到2000-4000字，普通薄写内容展开到1000-2000字。
-过程要充分但不机械：每个关键变化都要写出动机、停顿、反应、承接和余韵。
-必须覆盖：节奏推进、感官细节、呼吸与声音、对白、心理递进、关系变化。
-如果原文用日常借口或日常动作掩饰亲密场景后果，要还原被掩饰的真实情境和人物反应。
-严禁：省略号跳过、概括句代替、动作清单、说明书式描写、模板化段落。"""
-
-
 def _section_expand_system_prompt(quality: str = "balanced", character_info: str = "") -> str:
-    quality = _normalize_quality(quality)
-    base = (
-        _prompt_value("section_system_base")
-        .replace("{immersive_style_guide}", _prompt_value("immersive_style_guide"))
+    return (
+        _SECTION_EXPAND_SYSTEM_BASE
+        .replace("{immersive_style_guide}", "")
         .replace("{character_info}", character_info)
     )
-    if quality == "unleashed":
-        return base + _prompt_value("section_unleashed_addon")
-    return base
 
 SECTION_EXPAND_USER_PROMPT = """请处理【需要还原的片段】：
 - 如果有删减痕迹，就补完整。
@@ -1411,59 +1659,8 @@ DEFAULT_REWRITE_INSTRUCTION = (
 )
 
 
-def _default_quality_instruction(quality: str) -> str:
-    quality = _normalize_quality(quality)
-    if quality == "nuanced":
-        return (
-            "当前质量档位：细腻。\n"
-            "在不改变剧情结果的前提下，把关键过程写得更绵密、更有层次，尤其补足试探、停顿、呼吸、感官细节、嘴硬心乱和情绪递进。"
-        )
-    if quality == "unleashed":
-        return (
-            "当前质量档位：放开写。\n"
-            "亲密关键段落充分展开到约2000-4000字；普通薄写段落约1000-2000字。"
-            "优先增加情绪张力、停顿、反应、关系变化和余韵。"
-        )
-    return (
-        "当前质量档位：稳妥。\n"
-        "以修补明显省略和适度增密为主，不做过度拉长。"
-    )
-
-
 def _prompt_definitions() -> Dict[str, Dict[str, Any]]:
     return {
-        "immersive_style_guide": {
-            "group": "shared",
-            "group_label": "通用",
-            "label": "沉浸式写法规则",
-            "description": "批量扩写、分段扩写、指令重写都会注入的通用风格规则。",
-            "default": IMMERSIVE_INTIMACY_STYLE_GUIDE,
-            "rows": 12,
-        },
-        "quality_balanced": {
-            "group": "shared",
-            "group_label": "通用",
-            "label": "质量档位：稳妥",
-            "description": "选择“稳妥”时追加到用户提示词中的质量说明。",
-            "default": _default_quality_instruction("balanced"),
-            "rows": 5,
-        },
-        "quality_nuanced": {
-            "group": "shared",
-            "group_label": "通用",
-            "label": "质量档位：细腻",
-            "description": "选择“细腻”时追加到用户提示词中的质量说明。",
-            "default": _default_quality_instruction("nuanced"),
-            "rows": 5,
-        },
-        "quality_unleashed": {
-            "group": "shared",
-            "group_label": "通用",
-            "label": "质量档位：放开写",
-            "description": "选择“放开写”时追加到用户提示词中的质量说明。",
-            "default": _default_quality_instruction("unleashed"),
-            "rows": 6,
-        },
         "quick_check_system": {
             "group": "analysis",
             "group_label": "分析检测",
@@ -1484,9 +1681,10 @@ def _prompt_definitions() -> Dict[str, Dict[str, Any]]:
             "group": "analysis",
             "group_label": "分析检测",
             "label": "精细分析 System",
-            "description": "分段精细模式识别删减区域时使用。",
+            "description": "识别章节内省略、薄写、隐喻替代区域时使用。",
             "default": ANALYSIS_SYSTEM_PROMPT,
             "rows": 16,
+            "hidden": True,
         },
         "analysis_user": {
             "group": "analysis",
@@ -1495,6 +1693,7 @@ def _prompt_definitions() -> Dict[str, Dict[str, Any]]:
             "description": "可用变量：{numbered_paragraphs}",
             "default": ANALYSIS_USER_PROMPT,
             "rows": 14,
+            "hidden": True,
         },
         "one_pass_system_base": {
             "group": "one_pass",
@@ -1504,45 +1703,13 @@ def _prompt_definitions() -> Dict[str, Dict[str, Any]]:
             "default": _ONE_PASS_SYSTEM_BASE,
             "rows": 18,
         },
-        "one_pass_unleashed_addon": {
-            "group": "one_pass",
-            "group_label": "一次扩写",
-            "label": "一次扩写放开写追加",
-            "description": "质量档位为“放开写”时追加到一次扩写 System。",
-            "default": _ONE_PASS_SYSTEM_UNLEASHED_ADDON,
-            "rows": 8,
-        },
         "one_pass_user": {
             "group": "one_pass",
             "group_label": "一次扩写",
             "label": "一次扩写 User",
-            "description": "可用变量：{context_info} {quality_instruction} {chapter_title} {chapter_content} {next_chapter_info}",
+            "description": "可用变量：{context_info} {strategy_instruction} {chapter_title} {chapter_content} {next_chapter_info}",
             "default": ONE_PASS_USER_PROMPT,
             "rows": 16,
-        },
-        "section_system_base": {
-            "group": "section",
-            "group_label": "分段精细",
-            "label": "分段精细 System 基础",
-            "description": "精细扩写单个目标片段时使用。",
-            "default": _SECTION_EXPAND_SYSTEM_BASE,
-            "rows": 18,
-        },
-        "section_unleashed_addon": {
-            "group": "section",
-            "group_label": "分段精细",
-            "label": "分段精细放开写追加",
-            "description": "质量档位为“放开写”时追加到分段精细 System。",
-            "default": _SECTION_EXPAND_UNLEASHED_ADDON,
-            "rows": 8,
-        },
-        "section_user": {
-            "group": "section",
-            "group_label": "分段精细",
-            "label": "分段精细 User",
-            "description": "可用变量：{context_before} {section_content} {context_after} {additional_instruction}",
-            "default": SECTION_EXPAND_USER_PROMPT,
-            "rows": 14,
         },
         "rewrite_system": {
             "group": "rewrite",
@@ -1660,7 +1827,11 @@ def build_local_chapter_summary(chapter_title: str, chapter_content: str) -> str
 
 # ========== 快速扩写判断 ==========
 
-async def quick_check_needs_expansion(chapter_content: str, model: str = None) -> dict:
+async def quick_check_needs_expansion(
+    chapter_content: str,
+    model: str = None,
+    force_model: bool = False,
+) -> dict:
     """快速判断章节是否包含被删减内容，避免对无需扩写的章节进行无意义的处理。
 
     Returns:
@@ -1678,14 +1849,17 @@ async def quick_check_needs_expansion(chapter_content: str, model: str = None) -
 
     romance_count = _romance_signal_count(chapter_content)
     if check_mode == "romance_or_omission":
-        if romance_count >= 2:
+        # Pure romance words are noisy in long web-novel chapters. A low threshold
+        # caused normal relationship scenes to be expanded from scratch, which
+        # increases hallucination and plot loss. Keep this path conservative.
+        if romance_count >= 5:
             return {"needs_expansion": True, "reason": f"检测到暧昧/亲密信号 {romance_count} 处"}
         return {"needs_expansion": False, "reason": "未检测到明确省略或暧昧/亲密信号"}
 
     if check_mode == "omission_only":
         return {"needs_expansion": False, "reason": "未检测到明确省略/删减标记"}
 
-    if config.CONSERVE_REQUESTS:
+    if config.CONSERVE_REQUESTS and not force_model:
         return {"needs_expansion": False, "reason": "省请求模式：未检测到明确省略标记"}
 
     # 如果没有明显标记，用 AI 快速判断
@@ -1723,7 +1897,11 @@ async def quick_check_needs_expansion(chapter_content: str, model: str = None) -
 
 # ========== 核心分析逻辑 ==========
 
-async def analyze_chapter(chapter_content: str, model: str = None) -> Dict:
+async def analyze_chapter(
+    chapter_content: str,
+    model: str = None,
+    force_model: bool = False,
+) -> Dict:
     """分析章节，识别隐含性描写段落
 
     返回包含以下字段的字典：
@@ -1736,7 +1914,7 @@ async def analyze_chapter(chapter_content: str, model: str = None) -> Dict:
 
     paragraphs = split_into_paragraphs(chapter_content)
 
-    if config.CONSERVE_REQUESTS:
+    if config.CONSERVE_REQUESTS and not force_model:
         heuristic_sections = _heuristic_implicit_sections(paragraphs)
         return {
             "has_implicit_content": bool(heuristic_sections),
@@ -1863,7 +2041,7 @@ async def expand_chapter_one_pass(
     coverage_hint = _build_expansion_coverage_hint(chapter_title, chapter_content)
     if coverage_hint:
         context_info += coverage_hint
-    quality_instruction = _quality_instruction(quality)
+    strategy_instruction = _strategy_instruction(quality)
 
     next_chapter_info = ""
     if next_chapter_opening:
@@ -1876,33 +2054,14 @@ async def expand_chapter_one_pass(
 
     # 动态计算可用空间
     max_chars = config.get_max_content_chars(model)
-    nq = _normalize_quality(quality)
-    # 估算实际 prompt 开销（系统提示词 + 用户模板 + 质量指令 + 上下文信息）
-    prompt_overhead = 2000 if nq == "unleashed" else 1500
+    # 估算实际 prompt 开销（系统提示词 + 用户模板 + 策略说明 + 上下文信息）
+    prompt_overhead = 1500
     available_for_content = max_chars - prompt_overhead
 
-    # 质量感知的 one-pass 上限：超过则强制分段，防止输出过长导致质量下降
-    one_pass_limit = config.ONE_PASS_MAX_CHARS.get(nq, 20000)
+    # 默认综合模式的 one-pass 上限：超过则强制分段，防止输出过长导致质量下降
+    one_pass_limit = config.ONE_PASS_MAX_CHARS
     effective_limit = min(available_for_content, one_pass_limit)
     required_count = _infer_required_process_count(chapter_title, chapter_content)
-
-    if nq == "unleashed" and 3 <= required_count <= 12 and len(chapter_content) <= effective_limit:
-        logger.info(
-            "检测到多次连续关键过程，启用多请求扩写: title=%s count=%s",
-            chapter_title,
-            required_count,
-        )
-        return await _expand_multi_process_chapter(
-            chapter_title=chapter_title,
-            chapter_content=chapter_content,
-            prev_chapter_summary=prev_chapter_summary,
-            model=model,
-            quality=quality,
-            required_count=required_count,
-            progress_callback=progress_callback,
-            next_chapter_opening=next_chapter_opening,
-            segment_save_callback=segment_save_callback,
-        )
 
     if len(chapter_content) <= effective_limit:
         # 章节够短，一次处理
@@ -1910,7 +2069,7 @@ async def expand_chapter_one_pass(
             {"role": "system", "content": _one_pass_system_prompt(quality)},
             {"role": "user", "content": _render_prompt(
                 _prompt_value("one_pass_user"),
-                quality_instruction=quality_instruction,
+                strategy_instruction=strategy_instruction,
                 context_info=context_info,
                 chapter_title=chapter_title,
                 chapter_content=chapter_content,
@@ -1921,14 +2080,15 @@ async def expand_chapter_one_pass(
         if progress_callback:
             await progress_callback(0.3, "正在扩写...")
 
+        temperature = _select_temperature("one_pass", chapter_content, quality)
         result = await chat_completion(
             messages,
             model=model,
-            temperature=_select_temperature("one_pass", chapter_content, quality),
+            temperature=temperature,
             max_tokens=config.OUTPUT_RESERVED_TOKENS,
         )
 
-        min_chars = _min_unleashed_output_chars(chapter_title, chapter_content) if nq == "unleashed" else 0
+        min_chars = 0
         if min_chars and len(result or "") < min_chars:
             logger.warning(
                 "一次扩写输出过短，准备重试: title=%s output=%s min=%s",
@@ -1948,7 +2108,7 @@ async def expand_chapter_one_pass(
                 {"role": "system", "content": _one_pass_system_prompt(quality)},
                 {"role": "user", "content": _render_prompt(
                     _prompt_value("one_pass_user"),
-                    quality_instruction=quality_instruction,
+                    strategy_instruction=strategy_instruction,
                     context_info=retry_context,
                     chapter_title=chapter_title,
                     chapter_content=chapter_content,
@@ -1958,11 +2118,21 @@ async def expand_chapter_one_pass(
             retry_result = await chat_completion(
                 retry_messages,
                 model=model,
-                temperature=_select_temperature("one_pass", chapter_content, quality),
+                temperature=temperature,
                 max_tokens=config.OUTPUT_RESERVED_TOKENS,
             )
             if len(retry_result or "") > len(result or ""):
                 result = retry_result
+
+        result = await _retry_with_integrity_guard(
+            messages=messages,
+            source_text=chapter_content,
+            output_text=result,
+            model=model,
+            temperature=temperature,
+            forbidden_context=next_chapter_opening,
+            max_tokens=config.OUTPUT_RESERVED_TOKENS,
+        )
 
         if progress_callback:
             await progress_callback(1.0, "完成")
@@ -1998,21 +2168,20 @@ async def _expand_long_chapter(
     5. 动态计算分段大小
     """
     paragraphs = split_into_paragraphs(chapter_content)
-    quality_instruction = _quality_instruction(quality)
+    strategy_instruction = _strategy_instruction(quality)
 
     # 第一步：检测场景边界
     scenes = _detect_scenes(paragraphs)
     logger.info(f"长章节分段: {len(paragraphs)}个段落, {len(scenes)}个场景")
 
     # 动态计算可用空间来决定分段大小
-    nq = _normalize_quality(quality)
     max_chars = config.get_max_content_chars(model)
-    # 质量感知的分段目标大小
-    quality_segment_size = config.SEGMENT_SIZE_BY_QUALITY.get(nq, config.SEGMENT_SIZE)
+    # 默认综合模式的分段目标大小
+    default_segment_size = config.DEFAULT_SEGMENT_SIZE
     # 每个分段预留上下文和 prompt 空间
-    prompt_overhead = 2000 if nq == "unleashed" else 1500
+    prompt_overhead = 1500
     dynamic_segment_size = min(
-        quality_segment_size,
+        default_segment_size,
         max_chars - config.CONTEXT_BEFORE_CHARS - config.CONTEXT_AFTER_CHARS - prompt_overhead,
     )
     dynamic_segment_size = max(dynamic_segment_size, config.SEGMENT_MIN_SIZE)
@@ -2020,6 +2189,13 @@ async def _expand_long_chapter(
     # 第二步：基于场景构建分段
     segments = _build_segments_from_scenes(paragraphs, scenes, segment_size=dynamic_segment_size)
     logger.info(f"构建了 {len(segments)} 个分段 (目标大小: {dynamic_segment_size}字)")
+    segment_summaries = [
+        build_local_chapter_summary(
+            f"{chapter_title} 第{idx + 1}/{len(segments)}段",
+            segment["text"],
+        )
+        for idx, segment in enumerate(segments)
+    ]
 
     if not segments:
         logger.warning("分段构建结果为空，回退到整章处理")
@@ -2034,17 +2210,27 @@ async def _expand_long_chapter(
             {"role": "system", "content": _one_pass_system_prompt(quality)},
             {"role": "user", "content": _render_prompt(
                 _prompt_value("one_pass_user"),
-                quality_instruction=quality_instruction,
+                strategy_instruction=strategy_instruction,
                 context_info="",
                 chapter_title=chapter_title,
                 chapter_content=chapter_content[:max_chars],
                 next_chapter_info=nci,
             )},
         ]
-        return await chat_completion(
+        fallback_temperature = _select_temperature("one_pass", chapter_content, quality)
+        fallback_result = await chat_completion(
             messages,
             model=model,
-            temperature=_select_temperature("one_pass", chapter_content, quality),
+            temperature=fallback_temperature,
+            max_tokens=config.OUTPUT_RESERVED_TOKENS,
+        )
+        return await _retry_with_integrity_guard(
+            messages=messages,
+            source_text=chapter_content,
+            output_text=fallback_result,
+            model=model,
+            temperature=fallback_temperature,
+            forbidden_context=next_chapter_opening,
             max_tokens=config.OUTPUT_RESERVED_TOKENS,
         )
 
@@ -2056,9 +2242,14 @@ async def _expand_long_chapter(
         context_scene_indices = segment['context_scene_indices']
 
         # 构建上下文信息
-        context_info = ""
+        context_info = _build_segment_context_block(
+            chapter_title=chapter_title,
+            segments=segments,
+            segment_summaries=segment_summaries,
+            seg_idx=seg_idx,
+        ) + "\n"
         if seg_idx == 0 and prev_chapter_summary:
-            context_info = f"=== 上下文摘要（只用于人设/关系/设定，不要复述）===\n{_trim_summary_context(prev_chapter_summary)}\n"
+            context_info += f"=== 上下文摘要（只用于人设/关系/设定，不要复述）===\n{_trim_summary_context(prev_chapter_summary)}\n"
         if seg_idx == 0:
             context_info += _build_expansion_coverage_hint(chapter_title, chapter_content)
         elif seg_idx > 0:
@@ -2066,14 +2257,14 @@ async def _expand_long_chapter(
             if expanded_by_segment:
                 prev_result = expanded_by_segment[-1]
                 context_tail = _continuity_tail(prev_result)
-                context_info = f"=== 前文状态（前一段扩写结果末尾，只用于接续，严禁复述）===\n{context_tail}\n"
+                context_info += f"=== 前文状态（前一段扩写结果末尾，只用于接续，严禁复述）===\n{context_tail}\n"
             elif context_scene_indices:
                 # 回退：如果没有扩写结果可用，使用原文场景段落
                 context_text = '\n\n'.join(paragraphs[i] for i in context_scene_indices)
                 context_text = trim_to_sentence_boundary(
                     context_text, CONTINUITY_CONTEXT_CHARS, from_end=True
                 )
-                context_info = f"=== 前文状态（已处理部分末尾，只用于接续，严禁复述）===\n{context_text}\n"
+                context_info += f"=== 前文状态（已处理部分末尾，只用于接续，严禁复述）===\n{context_text}\n"
 
         # 如果是最后一个分段，注入下一章开头上下文
         next_info = ""
@@ -2088,7 +2279,7 @@ async def _expand_long_chapter(
             {"role": "system", "content": _one_pass_system_prompt(quality)},
             {"role": "user", "content": _render_prompt(
                 _prompt_value("one_pass_user"),
-                quality_instruction=quality_instruction,
+                strategy_instruction=strategy_instruction,
                 context_info=context_info,
                 chapter_title=f"{chapter_title}（第{seg_idx + 1}/{len(segments)}段）",
                 chapter_content=seg_text,
@@ -2100,10 +2291,20 @@ async def _expand_long_chapter(
             progress = (seg_idx + 0.3) / len(segments)
             await progress_callback(progress, f"正在扩写第{seg_idx + 1}/{len(segments)}段...")
 
+        temperature = _select_temperature("one_pass", seg_text, quality)
         result = await chat_completion(
             messages,
             model=model,
-            temperature=_select_temperature("one_pass", seg_text, quality),
+            temperature=temperature,
+            max_tokens=config.OUTPUT_RESERVED_TOKENS,
+        )
+        result = await _retry_with_integrity_guard(
+            messages=messages,
+            source_text=seg_text,
+            output_text=result,
+            model=model,
+            temperature=temperature,
+            forbidden_context=next_chapter_opening if seg_idx == len(segments) - 1 else "",
             max_tokens=config.OUTPUT_RESERVED_TOKENS,
         )
         expanded_by_segment.append(result)
@@ -2122,6 +2323,7 @@ async def _expand_long_chapter(
 
     # 第四步：合并分段结果（每个分段对应不重叠的段落，直接拼接即可）
     final_text = '\n\n'.join(expanded_by_segment)
+    final_text, _ = _strip_forbidden_context_leak(final_text, next_chapter_opening)
     return final_text
 
 
@@ -2158,7 +2360,7 @@ async def expand_chapter_detailed(
     if skip_if_no_content:
         if progress_callback:
             await progress_callback(0.03, "正在检测是否需要扩写...")
-        check = await quick_check_needs_expansion(chapter_content, model=model)
+        check = await quick_check_needs_expansion(chapter_content, model=model, force_model=True)
         if not check.get("needs_expansion", True):
             logger.info(f"章节无需扩写: {check.get('reason', '')}")
             if progress_callback:
@@ -2169,7 +2371,7 @@ async def expand_chapter_detailed(
         await progress_callback(0.05, "正在分析章节内容...")
 
     # 第一阶段：分析章节，识别隐含性描写段落
-    analysis = await analyze_chapter(chapter_content, model=model)
+    analysis = await analyze_chapter(chapter_content, model=model, force_model=True)
 
     if not analysis.get("has_implicit_content", False):
         if progress_callback:
@@ -2178,7 +2380,7 @@ async def expand_chapter_detailed(
 
     # 第二阶段：逐区域扩写
     paragraphs = split_into_paragraphs(chapter_content)
-    sections = analysis.get("sections", [])
+    sections = _normalize_analysis_sections(analysis.get("sections", []), len(paragraphs))
     characters = analysis.get("characters", [])
 
     if not sections:
@@ -2231,7 +2433,7 @@ async def expand_chapter_detailed(
 
         if desc:
             additional_parts.append(f"分析提示：{desc}")
-        additional_parts.append(_quality_instruction(quality))
+        additional_parts.append(_strategy_instruction(quality))
         if sec_type:
             additional_parts.append(f"省略类型：{sec_type}")
         if intensity:
@@ -2257,7 +2459,7 @@ async def expand_chapter_detailed(
                 quality=quality, character_info=character_info,
             )},
             {"role": "user", "content": _render_prompt(
-                _prompt_value("section_user"),
+                SECTION_EXPAND_USER_PROMPT,
                 context_before=context_before if context_before else "（章节开头）",
                 section_content=section_content,
                 context_after=context_after if context_after else (
@@ -2312,7 +2514,13 @@ async def expand_chapter_detailed(
             f"偏移量={offset}"
         )
 
-    return merge_paragraphs(expanded_paragraphs)
+    final_text = merge_paragraphs(expanded_paragraphs)
+    final_text, leaked = _strip_forbidden_context_leak(final_text, next_chapter_opening)
+    issues = _source_coverage_issues(chapter_content, final_text)
+    if leaked or issues:
+        issue_text = "；".join((["输出结尾复制了参考上下文"] if leaked else []) + issues)
+        raise ExpansionIntegrityError(f"精细扩写完整性校验失败：{issue_text}")
+    return final_text
 
 
 # ========== 段落重写（流式） ==========
@@ -2350,10 +2558,7 @@ async def stream_rewrite_paragraph(
         )
 
     messages = [
-        {"role": "system", "content": _prompt_value("rewrite_system").replace(
-            "{immersive_style_guide}",
-            _prompt_value("immersive_style_guide"),
-        )},
+        {"role": "system", "content": _prompt_value("rewrite_system").replace("{immersive_style_guide}", "").strip()},
         {"role": "user", "content": _render_prompt(
             _prompt_value("rewrite_user"),
             instruction=instruction,
@@ -2378,10 +2583,7 @@ async def stream_expand_single_paragraph(
         instruction = "根据当前段落内容补充细节，扩写这一段。"
 
     messages = [
-        {"role": "system", "content": _prompt_value("rewrite_system").replace(
-            "{immersive_style_guide}",
-            _prompt_value("immersive_style_guide"),
-        )},
+        {"role": "system", "content": _prompt_value("rewrite_system").replace("{immersive_style_guide}", "").strip()},
         {
             "role": "user",
             "content": (

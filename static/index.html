@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>小说扩写助手</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2316223a'/%3E%3Cpath d='M18 16h21c4 0 7 3 7 7v25H24c-3 0-6-3-6-6V16Z' fill='%23f2c66d'/%3E%3Cpath d='M24 23h16M24 31h13M24 39h10' stroke='%2316223a' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
-    <link rel="stylesheet" href="/static/css/style.css?v=20260429-login-page">
+    <link rel="stylesheet" href="/static/css/style.css?v=20260514-mobile-nav-collapse">
 </head>
 <body>
 
@@ -134,46 +134,63 @@
         <main class="main-content">
             <!-- Content Header -->
             <div class="content-header" v-if="currentChapter">
-                <span class="chapter-name">{{ currentChapter.title }}</span>
-                <div class="view-tabs">
+                <div class="content-header-main">
+                    <span class="chapter-name">{{ currentChapter.title }}</span>
                     <button
-                        class="view-tab"
-                        :class="{ active: viewMode === 'original' }"
-                        @click="viewMode = 'original'"
-                    >原文</button>
-                    <button
-                        class="view-tab"
-                        :class="{ active: viewMode === 'expanded' }"
-                        @click="viewMode = 'expanded'"
-                        :disabled="!hasExpanded"
+                        class="btn btn-ghost btn-sm chapter-tools-toggle"
+                        :class="{ active: showChapterTools }"
+                        @click.stop="showChapterTools = !showChapterTools"
                     >扩写</button>
-                    <button
-                        class="view-tab"
-                        :class="{ active: viewMode === 'compare' }"
-                        @click="viewMode = 'compare'"
-                        :disabled="!hasExpanded"
-                    >对比</button>
-                    <button
-                        class="btn btn-primary btn-sm"
-                        style="margin-left: 12px;"
-                        @click="showChapterRewriteInstruction"
-                        :disabled="isExpanding || isExpandingCurrent || isChapterRewriting"
-                    >
-                        <span v-if="isChapterRewriting" class="spinner"></span>
-                        &#128221; 指令重写整章
-                    </button>
-                    <button
-                        v-if="hasExpanded"
-                        class="btn btn-ghost btn-sm"
-                        style="margin-left: 4px;"
-                        @click="undoExpansion"
-                        :disabled="!canUndo"
-                    >&#8630; 撤销</button>
+                </div>
+                <div class="chapter-tools-panel" v-show="showChapterTools">
+                    <div class="view-tabs">
+                        <button
+                            class="view-tab"
+                            :class="{ active: viewMode === 'original' }"
+                            @click="viewMode = 'original'"
+                        >原文</button>
+                        <button
+                            class="view-tab"
+                            :class="{ active: viewMode === 'expanded' }"
+                            @click="viewMode = 'expanded'"
+                            :disabled="!hasExpanded"
+                        >扩写</button>
+                        <button
+                            class="view-tab"
+                            :class="{ active: viewMode === 'compare' }"
+                            @click="viewMode = 'compare'"
+                            :disabled="!hasExpanded"
+                        >对比</button>
+                    </div>
+                    <div class="chapter-tool-actions">
+                        <button
+                            class="btn btn-primary btn-sm"
+                            @click="showChapterRewriteInstruction"
+                            :disabled="isExpanding || isExpandingCurrent || isChapterRewriting"
+                        >
+                            <span v-if="isChapterRewriting" class="spinner"></span>
+                            &#128221; 指令重写整章
+                        </button>
+                        <button
+                            v-if="hasExpanded"
+                            class="btn btn-ghost btn-sm"
+                            @click="undoExpansion"
+                            :disabled="!canUndo"
+                        >&#8630; 撤销</button>
+                        <button
+                            class="btn btn-ghost btn-sm"
+                            @click="openChapterEditor('original')"
+                        >编辑原文</button>
+                        <button
+                            class="btn btn-ghost btn-sm"
+                            @click="openChapterEditor('expanded')"
+                        >编辑扩写</button>
+                    </div>
                 </div>
             </div>
 
             <!-- Content Body -->
-            <div class="content-body">
+            <div class="content-body" ref="contentBodyRef">
 
                 <!-- Empty State -->
                 <div v-if="!currentChapter" class="empty-state">
@@ -193,7 +210,6 @@
                                 class="paragraph-block"
                                 :class="{ changed: isParagraphDifferent(para.index) }"
                             >
-                                <span class="para-index">{{ para.index + 1 }}</span>
                                 <div class="para-text" v-html="renderCompareDiff(para.index, 'original')"></div>
                             </div>
                         </div>
@@ -207,7 +223,6 @@
                                 class="paragraph-block expanded"
                                 :class="{ changed: isParagraphDifferent(para.index) }"
                             >
-                                <span class="para-index">{{ para.index + 1 }}</span>
                                 <div class="para-text" v-html="renderCompareDiff(para.index, 'expanded')"></div>
                             </div>
                         </div>
@@ -246,7 +261,6 @@
                             @mouseenter="hoveredParagraphIndex = para.index"
                             @mouseleave="hoveredParagraphIndex = null"
                         >
-                            <span class="para-index">{{ para.index + 1 }}</span>
                             <div class="para-text" :data-para-index="para.index">
                                 {{ getParaDisplayText(para) }}<span v-if="isStreamingPara(para.index)" class="typing-cursor"></span>
                             </div>
@@ -277,6 +291,12 @@
                             <button class="btn btn-ghost btn-sm" @click="cancelManualEdit">取消</button>
                         </div>
                     </template>
+                </div>
+
+                <div v-if="currentChapter" class="chapter-read-nav chapter-read-nav-bottom">
+                    <button class="btn btn-ghost btn-sm" @click="selectRelativeChapter(-1)" :disabled="!hasPreviousChapter">上一章</button>
+                    <button class="btn btn-ghost btn-sm" @click="openCatalogFromReader">目录</button>
+                    <button class="btn btn-ghost btn-sm" @click="selectRelativeChapter(1)" :disabled="!hasNextChapter">下一章</button>
                 </div>
 
             </div>
@@ -416,10 +436,13 @@
             <div class="panel-section panel-history">
                 <div class="panel-section-title">
                     <span>任务</span>
-                    <span class="text-muted">{{ queueTasks.length }}</span>
+                    <span class="task-title-actions">
+                        <button class="btn btn-ghost btn-xs" @click="clearTaskHistory" :disabled="!canClearTaskHistory">清空</button>
+                        <span class="text-muted">{{ queueTasks.length }}</span>
+                    </span>
                 </div>
                 <div class="task-history-list">
-                    <div v-for="task in queueTasks" :key="'q-' + task.id" class="task-history-item" :class="taskStatusClass(task)">
+                    <div v-for="task in sortedQueueTasks" :key="'q-' + task.id" class="task-history-item" :class="taskStatusClass(task)">
                         <div class="task-history-top">
                             <span>#{{ task.id }} {{ taskStatusText(task) }} · {{ task.novel_title || ('小说' + task.novel_id) }}</span>
                             <span class="text-muted">{{ formatDate(task.created_at) }}</span>
@@ -489,7 +512,16 @@
         </div>
     </div>
 
-    <nav class="mobile-bottom-nav">
+    <button
+        class="mobile-bottom-nav-toggle"
+        :class="{ active: !mobileNavCollapsed }"
+        @click="mobileNavCollapsed = !mobileNavCollapsed"
+        :aria-label="mobileNavCollapsed ? '展开底部菜单' : '收起底部菜单'"
+    >
+        {{ mobileNavCollapsed ? '菜单' : '收起' }}
+    </button>
+
+    <nav class="mobile-bottom-nav" v-show="!mobileNavCollapsed">
         <button class="mobile-nav-btn" :class="{ active: leftCollapsed && rightCollapsed }" @click="showReadingPanel">
             <span class="mobile-nav-icon">&#128214;</span>
             <span>阅读</span>
@@ -502,7 +534,7 @@
             <span class="mobile-nav-icon">&#9881;</span>
             <span>任务</span>
         </button>
-        <button class="mobile-nav-btn" @click="openSettingsModal">
+        <button class="mobile-nav-btn" @click="openSettingsModal(); mobileNavCollapsed = true">
             <span class="mobile-nav-icon">&#9881;</span>
             <span>设置</span>
         </button>
@@ -667,22 +699,8 @@
                 <!-- Expand Configuration Panel -->
                 <div class="settings-panel expand-settings-panel" v-else-if="settingsActiveTab === 'expand'">
                     <div class="setting-card">
-                        <div class="setting-card-title">扩写方式</div>
-                        <div class="setting-card-desc">控制批量扩写时的处理策略。一次扩写适合短中篇章节，分段精细适合长章节或需要更稳定衔接的内容。</div>
-                        <div class="pill-group pill-group-settings">
-                            <button class="pill" :class="{ active: expandMode === 'one_pass' }" @click="expandMode = 'one_pass'">一次扩写</button>
-                            <button class="pill" :class="{ active: expandMode === 'detailed' }" @click="expandMode = 'detailed'">分段精细</button>
-                        </div>
-                    </div>
-
-                    <div class="setting-card">
-                        <div class="setting-card-title">扩写质量</div>
-                        <div class="setting-card-desc">质量越高，单章输出越长、等待时间越久。当前选择会立即用于下一次扩写。</div>
-                        <div class="pill-group pill-group-settings">
-                            <button class="pill" :class="{ active: expandQuality === 'balanced' }" @click="expandQuality = 'balanced'">稳妥</button>
-                            <button class="pill" :class="{ active: expandQuality === 'nuanced' }" @click="expandQuality = 'nuanced'">细腻</button>
-                            <button class="pill pill-accent" :class="{ active: expandQuality === 'unleashed' }" @click="expandQuality = 'unleashed'">放开写</button>
-                        </div>
+                        <div class="setting-card-title">默认综合扩写</div>
+                        <div class="setting-card-desc">系统固定使用综合策略：短章整章处理，长章按场景自动分段，并在分段间传递摘要、首尾锚点和前文状态，避免丢剧情或串到下一章。</div>
                     </div>
 
                     <div class="setting-card">
@@ -859,6 +877,33 @@
         </div>
     </div>
 
+    <!-- ==================== Chapter Editor Modal ==================== -->
+    <div class="modal-overlay" v-if="chapterEditorVisible" @click.self="closeChapterEditor">
+        <div class="modal-box modal-box-wide chapter-editor-modal">
+            <div class="modal-title">
+                {{ chapterEditorTarget === 'original' ? '编辑原文' : '编辑扩写内容' }}
+                <button class="modal-close" @click="closeChapterEditor">&times;</button>
+            </div>
+            <textarea
+                class="chapter-edit-textarea"
+                v-model="chapterEditorText"
+                spellcheck="false"
+            ></textarea>
+            <div class="settings-actions">
+                <div class="settings-actions-left">
+                    <span class="setting-hint">{{ chapterEditorTarget === 'original' ? '保存后会更新原文章节和摘要上下文。' : '保存后会作为当前扩写版本，可用撤销恢复上一版。' }}</span>
+                </div>
+                <div class="settings-actions-right">
+                    <button class="btn btn-ghost" @click="closeChapterEditor" :disabled="chapterEditorSaving">取消</button>
+                    <button class="btn btn-primary" @click="saveChapterEditor" :disabled="chapterEditorSaving">
+                        <span v-if="chapterEditorSaving" class="spinner"></span>
+                        {{ chapterEditorSaving ? '保存中...' : '保存' }}
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- ==================== Delete Confirmation Modal ==================== -->
     <div class="modal-overlay" v-if="showDeleteConfirm" @click.self="showDeleteConfirm = false; deleteTarget = null">
         <div class="modal-box">
@@ -911,7 +956,7 @@
 </div>
 
 <script src="/static/vendor/vue.global.prod.js"></script>
-<script src="/static/js/app.js?v=20260511-api-key-profiles"></script>
+<script src="/static/js/app.js?v=20260514-mobile-nav-collapse"></script>
 
 </body>
 </html>
