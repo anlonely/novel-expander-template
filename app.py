@@ -256,11 +256,29 @@ def _is_no_expansion_notice(expanded: str, input_content: str) -> bool:
     1. 返回值与输入原文完全相同
     2. 返回值 <= 500字 且含已知通知短语
     3. 返回值不足原文的 30% 且含已知通知短语
+    4. 返回值开头是"无需扩写"通知，后面又直接附带原文
     """
     if expanded == input_content:
         return True
     if not expanded:
         return True
+    stripped = expanded.lstrip()
+    head = stripped[:260]
+    starts_with_notice = any(signal in head for signal in _NO_EXPANSION_NOTICE_SIGNALS)
+    if starts_with_notice:
+        if not input_content:
+            return True
+        anchors = []
+        source = input_content.strip()
+        if source:
+            anchors.append(source[:120])
+            if len(source) > 360:
+                mid = len(source) // 2
+                anchors.append(source[max(0, mid - 60):mid + 60])
+                anchors.append(source[-120:])
+        anchors = [anchor for anchor in anchors if len(anchor) >= 40]
+        if not anchors or sum(1 for anchor in anchors if anchor in expanded) >= min(2, len(anchors)):
+            return True
     if len(expanded) <= 500:
         for signal in _NO_EXPANSION_NOTICE_SIGNALS:
             if signal in expanded:

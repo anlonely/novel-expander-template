@@ -341,6 +341,39 @@ _OMISSION_PATTERNS = [
     re.compile(r'良久[，。…]?'),
 ]
 
+_BROAD_OMISSION_PATTERN_SOURCES = {r'[…]{2,}', r'[\*×□]{3,}', r'良久[，。…]?'}
+
+_MASKED_CONTACT_PATTERN = re.compile(r'(?:\d[\s\-]*){2,}[\*×□]{3,}|[\*×□]{3,}(?:[\s\-]*\d){2,}')
+
+_OMISSION_CONTEXT_PATTERN = re.compile(
+    r'酒店|房间|卧室|浴室|床|被子|洗澡|衣服|衣裙|丝袜|裙|胸|臀|翘臀|腿|腰|唇|吻|亲|抱|搂|摸|抚|脱|'
+    r'暧昧|亲密|身体|肌肤|脸红|羞|喘|呻吟|轻哼|低吟|腿软|腰酸|酣睡|疲惫|神清气爽|睡去|'
+    r'任务完成|系统提示|抽奖|奖励|一夜|一晚上|整晚|温柔乡|人车合一|F1|高速|驾驶技术|亲自驾驶|'
+    r'大战|顶不住|主动|承诺|履行|我不会|被胁迫|该发生的已经发生|奖励已经到手|衣服.{0,16}(?:撕烂|碎|破)|'
+    r'滋味.{0,12}不错|疲软期|继续陪你|想怎么样就怎么样'
+)
+
+_NORMAL_ELLIPSIS_CONTEXT_PATTERN = re.compile(
+    r'各位乘客|列车即将|航班即将|检票|登机|感谢.{0,30}(?:送|打赏)|主持人|直播间|'
+    r'系统面板|辅助词条|渣女[一二三四五六七八九十0-9]+级|宿主：|任务[（(]|'
+    r'颜值|身高|体重|电话号码|手机号|号码|账号'
+)
+
+_SHORT_DIALOGUE_ELLIPSIS_PATTERN = re.compile(r'^[“"\'‘]?\s*[^。！？!?；;\n]{0,32}…+[。！？!?]?\s*[”"\'’]?$')
+
+_PROFILE_STATUS_PATTERN = re.compile(
+    r'系统面板|辅助词条|渣女[一二三四五六七八九十0-9]+级|宿主：|颜值|身高|体重|年龄|职业|'
+    r'攻略对象|任务[（(]|奖励[：:]|属性[：:]|状态[：:]'
+)
+
+_ROMANCE_ACTION_CONTEXT_PATTERN = re.compile(
+    r'酒店|房间|卧室|浴室|床|床边|躺到床|被子|衣服|衣裙|裙|睡裙|丝袜|胸|臀|翘臀|腿|腰|唇|吻|亲|抱|搂|摸|抚|脱|'
+    r'身体|肌肤|脸红|羞|喘|轻哼|低吟|腿软|腰酸|酣睡|疲惫|睡去|神清气爽|'
+    r'任务完成|系统提示|抽奖|奖励已经到手|一夜|这一夜|一晚上|整晚|温柔乡|人车合一|F1|高速|驾驶技术|亲自驾驶|'
+    r'履行.{0,20}承诺|自己动手|我不会|被胁迫|该发生的已经发生|衣服.{0,16}(?:撕烂|碎|破)|'
+    r'滋味.{0,12}不错|疲软期|继续陪你|想怎么样就怎么样|半路.{0,30}(?:凶残|甜头)'
+)
+
 _ROMANCE_PATTERNS = [
     re.compile(p)
     for p in (
@@ -357,9 +390,127 @@ _ROMANCE_PATTERNS = [
 ]
 
 
+_IMPLICIT_JUMP_PATTERNS = [
+    (
+        "关键过程刚开始后直接跳到任务完成",
+        re.compile(
+            r'(?:履行[^。！？\n]{0,20}承诺|答应你的事情已经做到|轮到你[^。！？\n]{0,20}承诺)'
+            r'[\s\S]{0,1200}'
+            r'(?:酒店|房间|床|躺到床|衣服鞋子|被胁迫|我不会|男朋友|做这种事)'
+            r'[\s\S]{0,900}'
+            r'(?:只能自己动手|只好自己动手|自己动手了?)'
+            r'[\s\S]{0,360}'
+            r'(?:任务完成|系统[^。！？\n]{0,30}提示)',
+            re.S,
+        ),
+    ),
+    (
+        "对话承认不会后直接跳到结果",
+        re.compile(
+            r'(?:被胁迫的觉悟|我不会|有男朋友|做这种事)'
+            r'[\s\S]{0,700}'
+            r'(?:只能自己动手|只好自己动手|自己动手了?)'
+            r'[\s\S]{0,360}'
+            r'(?:任务完成|系统[^。！？\n]{0,30}提示)',
+            re.S,
+        ),
+    ),
+    (
+        "长时段亲密过程被概括后直接跳到结果",
+        re.compile(
+            r'(?:这一夜|一整夜|整整一夜|一夜[^。！？\n]{0,40}|温柔乡|极致[^。！？\n]{0,20}温柔)'
+            r'[\s\S]{0,900}'
+            r'(?:有经验|主动满足|疲惫|努力动作|休息吧|扶了下来|睡去|沉沉地)'
+            r'[\s\S]{0,520}'
+            r'(?:任务完成|系统[^。！？\n]{0,30}提示|获得抽奖|奖励)',
+            re.S,
+        ),
+    ),
+    (
+        "车辆驾驶隐喻概括长时段过程",
+        re.compile(
+            r'(?:一晚(?:上)?|一夜|经过一夜|昨天晚上|前天晚上)'
+            r'[\s\S]{0,700}'
+            r'(?:人车合一|高速|遛一遛|F1|驾驶技术|亲自驾驶|坐高铁|头等舱|开车|车速|磨合)'
+            r'[\s\S]{0,700}'
+            r'(?:神清气爽|洗漱|酣睡|慵懒|掀开被子|翘臀|啪|意见也消散)',
+            re.S,
+        ),
+    ),
+    (
+        "事后承接反推关键过程被跳过",
+        re.compile(
+            r'(?:该发生的已经发生|反正该发生|奖励已经到手|系统提示[^。！？\n]{0,40}(?:抽奖|奖励)|抽奖次数\s*\+?\s*1)'
+            r'[\s\S]{0,900}'
+            r'(?:疲软期|洗完.{0,12}澡|穿好衣服|衣服.{0,16}(?:撕烂|碎|破)|弄了|主动.{0,12}服务|继续陪你|想怎么样就怎么样|滋味.{0,12}不错)',
+            re.S,
+        ),
+    ),
+    (
+        "上一段过程只用事后状态概括",
+        re.compile(
+            r'(?:半路.{0,40}(?:尝到甜头|凶残)|判若两人|久旷|衣服.{0,16}(?:撕烂|碎|破)|滋味.{0,12}不错|依依不舍)'
+            r'[\s\S]{0,700}'
+            r'(?:系统提示[^。！？\n]{0,40}(?:抽奖|奖励)|抽奖次数\s*\+?\s*1|任务完成|奖励已经到手)',
+            re.S,
+        ),
+    ),
+]
+
+
 def _romance_signal_count(text: str) -> int:
     """Count broad romance/intimacy signals before spending model tokens."""
     return sum(len(pattern.findall(text)) for pattern in _ROMANCE_PATTERNS)
+
+
+def _has_omission_context(paragraphs: List[str], idx: int) -> bool:
+    """Return true when a broad marker is near high-confidence expansion context."""
+    start = max(0, idx - 2)
+    end = min(len(paragraphs), idx + 3)
+    window = "\n".join(paragraphs[start:end])
+    return bool(_OMISSION_CONTEXT_PATTERN.search(window))
+
+
+def _is_short_dialogue_pause(paragraph: str) -> bool:
+    """Return true for ordinary dialogue pauses like "我劝你……"."""
+    stripped = paragraph.strip()
+    if _SHORT_DIALOGUE_ELLIPSIS_PATTERN.match(stripped):
+        return True
+    compact = stripped.strip('“”"\'‘’').strip()
+    if "…" not in compact or len(compact) > 42:
+        return False
+    after = compact.split("…", 1)[1]
+    return not bool(re.search(r'[\u4e00-\u9fffA-Za-z0-9]', after))
+
+
+def _romance_context_needs_expansion(text: str, romance_count: int) -> bool:
+    """Treat romance words as a fallback only when there is real skipped-action context."""
+    if romance_count < 8:
+        return False
+    if not _ROMANCE_ACTION_CONTEXT_PATTERN.search(text):
+        return False
+    if _PROFILE_STATUS_PATTERN.search(text) and romance_count < 12:
+        return False
+    return True
+
+
+def _is_actionable_omission_hit(paragraphs: List[str], idx: int, pattern: re.Pattern) -> bool:
+    """Filter broad punctuation/masking markers so ordinary pauses do not trigger expansion."""
+    paragraph = paragraphs[idx] if 0 <= idx < len(paragraphs) else ""
+    source = pattern.pattern
+    if source == r'[\*×□]{3,}' and _MASKED_CONTACT_PATTERN.search(paragraph):
+        return False
+    if source == r'[…]{2,}':
+        start = max(0, idx - 2)
+        end = min(len(paragraphs), idx + 3)
+        window = "\n".join(paragraphs[start:end])
+        if _NORMAL_ELLIPSIS_CONTEXT_PATTERN.search(window):
+            return False
+        if _is_short_dialogue_pause(paragraph):
+            return False
+    if source in _BROAD_OMISSION_PATTERN_SOURCES:
+        return _has_omission_context(paragraphs, idx)
+    return True
 
 
 def _detect_refusal(text: str) -> Optional[str]:
@@ -390,7 +541,7 @@ def _anchor_windows(text: str, size: int = 28) -> List[str]:
 
 
 def _paragraph_has_expansion_marker(paragraph: str) -> bool:
-    return any(pattern.search(paragraph) for pattern in _OMISSION_PATTERNS)
+    return bool(_heuristic_implicit_sections([paragraph]))
 
 
 def _source_coverage_issues(source_text: str, output_text: str) -> List[str]:
@@ -524,6 +675,8 @@ def _heuristic_implicit_sections(paragraphs: List[str]) -> List[Dict[str, Any]]:
         matched = None
         for pattern in _OMISSION_PATTERNS:
             if pattern.search(para):
+                if not _is_actionable_omission_hit(paragraphs, idx, pattern):
+                    continue
                 matched = pattern.pattern
                 break
         if matched:
@@ -535,6 +688,33 @@ def _heuristic_implicit_sections(paragraphs: List[str]) -> List[Dict[str, Any]]:
                 "characters_involved": [],
                 "intensity": "明显",
             })
+
+    joined = "\n".join(paragraphs)
+    if not joined:
+        return sections
+
+    def paragraph_index_for_offset(offset: int) -> int:
+        cursor = 0
+        for para_idx, para in enumerate(paragraphs):
+            end = cursor + len(para)
+            if offset <= end:
+                return para_idx
+            cursor = end + 1
+        return max(len(paragraphs) - 1, 0)
+
+    for label, pattern in _IMPLICIT_JUMP_PATTERNS:
+        match = pattern.search(joined)
+        if not match:
+            continue
+        sections.append({
+            "start_para": paragraph_index_for_offset(match.start()),
+            "end_para": paragraph_index_for_offset(match.end()),
+            "description": f"检测到隐式跳过: {label}",
+            "type": "implicit_jump",
+            "characters_involved": [],
+            "intensity": "明显",
+        })
+        break
     return sections
 
 
@@ -1391,12 +1571,18 @@ ANALYSIS_SYSTEM_PROMPT = """你是中文小说删减痕迹分析器，只做一�
    - "吹风着凉"实际是衣衫不整/身体暴露后的掩饰
    - "运动过度/锻炼"实际是激烈性爱
    判断方法：看前后文是否有亲密暗示、暧昧场景、两人独处，再结合身体症状是否不合常理。
+7. 【隐式跳过到结果】关键互动刚开始，下一句或短短几句就跳到结果/系统任务完成/状态变化。例如：房间或床边对话、履行承诺、角色说"我不会"后，只写"只能自己动手"或类似一句话，然后直接出现"任务完成"、奖励、事后状态；或用"这一夜/一整夜/温柔乡"概括长时段过程，随后直接写疲惫、休息、睡去、任务完成。这类属于"突兀跳转/跳跃叙述"。
+8. 【车辆驾驶隐喻】用"人车合一/高速/F1/驾驶技术/亲自驾驶/坐高铁头等舱/磨合/开车/车速"等车辆驾驶隐喻概括整晚过程，随后直接写神清气爽、洗漱、酣睡、掀被子、身体状态变化。这类属于"整场景扩展隐喻/跳跃叙述"。
+9. 【事后承接反推】章节或片段开头已经是事后状态，用"该发生的已经发生/奖励已经到手/系统提示抽奖/衣服被撕烂/洗完澡穿好衣服/疲软期/滋味不错/半路变得凶残/尝到甜头"等词交代过程已经发生，但没有展示关键过程。这类属于"突兀跳转/跳跃叙述"。
 
 不要误判：
 1. 正常时间推进。
 2. 已经写完整的互动。
 3. 与亲密内容无关的战斗、省略或转场。
 4. 角色确实因为正常原因生病（需结合前后文判断，没有亲密暗示时不要硬往性方面解读）。
+5. 普通语气停顿、沉默、欲言又止、直播感谢话术、列车/航班广播、章节标题衔接、手机号/账号遮挡（如 139********）不是删减。
+6. 普通系统任务讨论、抽奖说明、商业谈判、战斗或威胁场景，如果没有关键亲密/暧昧/身体接触过程被跳过，不要判定为需要扩写。
+7. 人物资料面板、系统属性、渣女等级、颜值/身高/体重/职业描述，以及普通暧昧词堆积，本身不是删减痕迹；必须看到“过程被跳过”的上下文证据才判定。
 
 【重要】当检测到整场景扩展隐喻（信号4）时：
 - metaphor_mapping 必须列出完整的隐喻→真实内容对照表
@@ -1642,12 +1828,16 @@ SUMMARY_SYSTEM_PROMPT = """你是一位专业的小说内容分析师。请为�
 
 用300-500字概括。只输出摘要，不要其他内容。"""
 
-QUICK_CHECK_SYSTEM_PROMPT = """你是一个文本分析助手。判断以下小说章节是否包含被编辑删减、省略或符号替代的内容。只回答 JSON。"""
+QUICK_CHECK_SYSTEM_PROMPT = """你是一个文本分析助手。判断以下小说章节是否包含被编辑删减、省略、符号替代，或关键互动刚开始就直接跳到结果/任务完成的隐式跳过。只回答 JSON。判断必须保守：普通省略号停顿、手机号/账号遮挡、直播/广播话术、章节衔接、人物资料面板、普通系统任务/奖励讨论、普通暧昧词堆积，都不要判为 true。"""
 
 QUICK_CHECK_USER_PROMPT = """请判断以下章节是否有被删减/省略的内容。
 
 回答格式（纯JSON）：
 {{"needs_expansion": true/false, "reason": "简要理由"}}
+
+判定为 true 的情况包括：省略号/符号屏蔽、"事毕/许久后"等跳跃、隐喻替代、一笔带过；角色进入房间/床边互动后只写"自己动手/任务完成/结果变化"；用"这一夜/温柔乡"概括长时段过程后直接写疲惫、休息、睡去、任务完成；用"人车合一/高速/F1/驾驶技术/亲自驾驶/坐高铁头等舱/磨合/开车"等车辆驾驶隐喻概括整晚过程；以及用"该发生的已经发生/奖励已经到手/系统提示抽奖/衣服被撕烂/洗完澡穿好衣服/疲软期/滋味不错/半路变得凶残/尝到甜头"反推关键过程已经发生但正文跳过。
+
+判定为 false 的情况包括：普通对话停顿或沉默的省略号、手机号/账号遮挡、直播感谢话术、列车/航班广播、章节标题衔接、人物资料/系统面板、普通系统任务/抽奖说明、普通战斗/威胁/商业谈判；如果只是有暧昧词、关系拉扯、人物评价或系统属性描述，但没有关键过程被省略，也返回 false。
 
 章节内容（前2000字）：
 {chapter_excerpt}"""
@@ -1845,6 +2035,8 @@ async def quick_check_needs_expansion(
     paragraphs = split_into_paragraphs(chapter_content)
     heuristic_sections = _heuristic_implicit_sections(paragraphs)
     if heuristic_sections:
+        if any(sec.get("type") == "implicit_jump" for sec in heuristic_sections):
+            return {"needs_expansion": True, "reason": "检测到关键过程被隐式跳过"}
         return {"needs_expansion": True, "reason": "检测到明确省略/删减标记"}
 
     romance_count = _romance_signal_count(chapter_content)
@@ -1852,7 +2044,7 @@ async def quick_check_needs_expansion(
         # Pure romance words are noisy in long web-novel chapters. A low threshold
         # caused normal relationship scenes to be expanded from scratch, which
         # increases hallucination and plot loss. Keep this path conservative.
-        if romance_count >= 5:
+        if _romance_context_needs_expansion(chapter_content, romance_count):
             return {"needs_expansion": True, "reason": f"检测到暧昧/亲密信号 {romance_count} 处"}
         return {"needs_expansion": False, "reason": "未检测到明确省略或暧昧/亲密信号"}
 
@@ -1889,6 +2081,8 @@ async def quick_check_needs_expansion(
 
     heuristic_sections = _heuristic_implicit_sections(split_into_paragraphs(chapter_content))
     if heuristic_sections:
+        if any(sec.get("type") == "implicit_jump" for sec in heuristic_sections):
+            return {"needs_expansion": True, "reason": "规则检测到关键过程被隐式跳过"}
         return {"needs_expansion": True, "reason": "规则检测到明显省略痕迹"}
 
     # 检测失败时保守处理：默认不扩写，避免无中生有
